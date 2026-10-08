@@ -5,6 +5,7 @@ description = "White-box study of filler-token uplift on DeepSeek V4 Flash"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "kernels>=0.17.2",
     "mechtools",
 ]
 
