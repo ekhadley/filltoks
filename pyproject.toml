@@ -1,0 +1,12 @@
+[project]
+name = "filltoks"
+version = "0.1.0"
+description = "White-box study of filler-token uplift on DeepSeek V4 Flash"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "mechtools",
+]
+
+[tool.uv.sources]
+mechtools = { git = "ssh://git@github.com/ekhadley/mechtools" }

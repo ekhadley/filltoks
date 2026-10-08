@@ -1,0 +1,139 @@
+## Notes on [Reading Between the Dots: Decoding hidden Computation across Filler Tokens](https://arxiv.org/pdf/2607.03502)
+
+- Their main proposed mechanism/algorithm  
+  - different intermediates  are computed during separate forward pass  
+    - Main evidence is logit lens/early decoding  
+      - Lens procedure  
+        - Take residual stream hidden states  
+          - From anywhere around the middle-late layers. 30-60 in dv3 and k2  
+        - Take RS vectors, apply final RMSnorm and then unembed to get token logits  
+        - Find the mean logits over all inputs and subtract this from the readouts to get the ‘token scores’  
+          - Removes static token artifacts, gives you the thing that changes between examples  
+        - Save the top T=30 tokens.  
+        - Give those tokens to llm judge and ask what the model seems to be thinking about  
+      - When you decode middle/late layer residual streams of certain filler tokens, you can see different intermediate values  
+      - A1 (which I assume just means the intermediate first listed in the question) appears in earlier tokens, disappears, and then you can see A2 in later positions?  
+        - It’s mildly surprising that A1 is actually (seemingly?) always computed first. You can totally compute A2 before computing A1, but I guess models just don’t? Maybe this is a confound that’s making their detection seem worse than it is.  
+      - Then you see neither of them in late tokens, but the final answer is visible.  
+        - Fig 3 shows the final answer only appearing at the last few layers of the last few token positions.  
+        - So it seems like the model is just barely computing it in time. Is this true?  
+          - Possibly just an artifact of averaging  
+        - What are the models doing in between those forward passes?  
+          - Main question: is it important stuff we can’t see, or is the model just wasting time?  
+            - Test: noise the positions that don’t seem to encode any interpretable intermediate.  
+    - The other kind of algorithm would be something more parallel where the model is using a bunch of looser heuristics to make a bunch of ‘shots on goal’ during every forward pass  
+      - Doing this many times and averaging makes a better quality guess than doing it just once  
+- “Aggregated across these 500 examples, the filler residual stream resembles the model’s ordinary single-pass computation spread across the available positions more than it resembles a written step-by-step derivation.”  
+  - This is an interesting hypothesis: are models basically just doing a single forward pass over many forward passes?  
+    - How would test?  
+    - In a sense this is a fairly natural algorithm  
+  - What does this mean exactly?  
+  - They also show the early decoding method for the no-filler regime  
+    - I would guess it looks something like “earlier layers encode A1, A2 appears later, then A1+A2 at the very end”  
+      - Which would be the single forward pass analogy to what we see with filler tokens  
+      - The alternative would be maybe, A1+A2 appearing simultaneously rather than sequentially  
+        - Which would suggest parallel lookup  
+        - But this seems unlikely given that models dont do it for forward tokens. If they are adept at parallel lookup, why not use it with filler tokens?  
+          - One answer would be that the models really *do* use an adaptive strategy of selecting different algorithms when given filler token scratch space. Seems plausible but not super likely.  
+    - I found the graph, my guess was wrong. A1 and A2 are resolved at the same layers but over different tokens.  
+      - It’s much worse at resolving A2 without fillers.  
+    - they actually show it for 2 tokens: the end of the question and the token where the model would start it’s answer  
+      - Interestingly, we see A1 and A2 merge at the exact same layers in the single forward pass as with filler tokens (about l42)  
+        - So the act of finding A1 and A2 seems to be done the exact same way (or at least in the same places) in both cases  
+      - It seems that A1 is encoded strongly on q\_end, around the middle layers, but A2 doesn’t seem strongly encoded anywhere?  
+        - A1 is encoded stronger than A2 on both q\_end and ans.  
+        - But we still see A1+A2 appearing at the very last layers of the final answer  
+        - Even on failing cases with filler tokens, A2 is quite strongly resolved (stronger even than in the correct cases?)  
+        - But on failing cases without filler, A2 is notably less resolved  
+          - So it seems that where the model fails by composition with filler tokens, failing to resolve intermediate A2 is probably a major cause of incorrect answers without filler tokens  
+          - The implication is that this is a big part of the uplift  
+            - The specific implication is that the model has a trouble doing parallel resolution of the intermediates during a single forward pass  
+      - So one possible synthesis here is that the model is using a single circuit to look up both A1 and A2 and this is basically just pretty unreliable if you only give it say one or two forward passes to do this  
+        - Most likely because it's unable to do them in parallel and filler tokens lets the model dedicate each individual run of the algorithm to a different forward pass  
+        - specific guess: the model doesn’t have a bandwidth to resolve both intermediates in parallel, and can do this much more reliably during separate forward passes  
+          - Corollary: the model must somehow decide “this forward pass I will compute A1” and then later “this forward pass I will compute A2”  
+            - Keep in mind, the model won’t be able to attend to the intermediate A1 itself when it starts computing A2. Since A1 is resolved around L42, and A2 is also resolved around then, it’s deciding to not compute A1 before it sees A1.  
+            - How does it do this?  
+              - Can tell from early layers “oh on that previous forward pass I started to compute A2, that should be done around layer 42\. I’ll start computing A2 now instead.”  
+              - Random selection?  
+- Ok is all of this A1 A2 stuff just silly? Deepseek v3 only has like 4% uplift between no filler tokens and 100\!  
+  - Not a good example. Yes its’ outside error bars, but not by a lot.  
+  - And for things to be studied mechanistically, that difference would def be within error bars. Whitebox big error bar.  
+- 1 fact addition seems like a much better task, given the size of the uplift.  
+  - But basically all the whitebox work in the paper seems to be for the system of equations or 2-fact task  
+  - The fact that 1 fact gets so much uplift is theory against the ‘bandwidth limited’ hypothesis for why 2-fact lookup fails or why filler tokens help there  
+    - You don’t need as much bandwidth to look up 1 fact  
+    - And in particular, if we thought part of the issue with 2-fact was that the model wants to use the same circuit for two different things, but it cant because they interfere, that’s not a problem here  
+    - The model is doing 1 fact lookup and 1 addition.  
+      - So the issue is either that the addition can’t happen in the same  
+- Also: what about with more filler tokens?  
+  - This feels like a big part of the thing I care about  
+  - I sort of get how a few filler tokens would be useful  
+  - But the fact that the gains scale with more filler suggests … something  
+    - Probably that either  
+      - the model has multiple algorithms that the model runs on different time horizons  
+      - or the model has a single algorithm that it reruns and continues to give uplift each time  
+    - Or both
+
+## [Notes on olivia’s findings](https://docs.google.com/document/d/14aauJ6KSyBfIffi305RwyBenI7KkB6UM-uioYiic2x8/edit?tab=t.0)
+
+- Primary hypothesis: model is just making lots of shots on goal. Aggregating more of these  final answer guesses is better than doing fewer  
+  - This class of algorithms (or all classes) make up a spectrum concerning the number of filler tokens over which it generates a final answer guess  
+    - The minimum is 1 token: the model just does the same thing on literally every forward pass, producing a final answer guess at the end of each one  
+    - The maximum is potentially unbounded? The algorithm could be stochastic/non-repeating  
+  - Because we do see different filler tokens encode different intermediates: so 1-forward pass algorithms are not the only kind  
+    - It seems implausible that single forward passes are likely to be very important in general, based on these results?  
+- Another way to frame this spectrum is the width of the algorithm the model implements  
+  - Width \~= number of forward passes it uses  
+  - As the opener says, models are still limited in terms of maximum serial depth by the number of layers  
+- The original paper is definitely useful (falsifies the 1-forward pass hypothesis, but that wasnt so likely in the first place), but I think this report focuses on the more interesting question of “why does this scale with more filler?”  
+- Overall methods  
+  - Original paper seemingly does not ask this question  
+  - Dv4f through API on the system of equation task  
+    - 10-shot with filler is interesting format. I think it’s correct  
+      - One small possible confounder is that if the model’s already computed some product in one of the previous shots, it may be able to just attend to that instead of recomputing on the test problem? Not sure if this is controlled for and the objective odds are pretty low, but.  
+      - Filler in the prefills seems pretty good. Probably makes the model less confused when using them later on.  
+  - Baseline uplift of %15.6 with 100 filler. Pretty significant. Definitely something  
+- Uplift per question type compared to no-filler performance   
+  - Apparently the uplift is moderate when the correct answer is most common, and when it is never sampled  
+    - And uplift is largest (by a lot) when the answer is present but not most common  
+  - Also tested with temperature. What does this do exactly?  
+    - Lowering the temperature is similar to maj voting  
+      - Moves probability mass from lower prob answers to higher prob ones  
+    - So when the correct answer is most common, maj voting should give uplift  
+      - When it’s not the most common, it will hurt performance  
+  - So these plots do seem to show that the filler tokens aren't just leading the model to guess the same thing multiple times, and artificially sharpen its own distribution  
+    - This does assume that the distribution of the no-filler responses and the filler token responses (and to the extent there are more than 1, each subsequent guess in the filler token’s guesses) share the same distribution  
+  - So this boosts other hypotheses:  
+    - The model is doing more complicated aggregation strategies than just sharpening  
+      - Certain types of problems have verification heuristics that you can apply once you have a guess.  
+        - In such problems you can do much better than maj@k and it acts more like pass@k if you have a reliable verifier. Big returns to diverse guesses  
+        - But that doesn’t seem to apply for these  
+      -   
+    - The model is making guesses from different distributions on each run of whatever algorithm it’s using  
+      - This could look like “just reattempting the same question, but getting slightly different distributions on each span of the filler tokens because the preceding context is slightly different for each span”  
+        - h.t. kylie for this hypothesis  
+    - The model is only making 1 proper guess, and doing all the intermediate stpes many times or double checking and aggregating these  before making its final answer  
+- The uplift per question is very noisy  
+  - And bimodal, it seems. There seems to be a distinct class of non-movers, and a spectrum of movers  
+- Disrupting n filler tokens seems to have the effect of just giving the model n fewer filler tokens  
+  - This is quite interesting, related to many of my main questions.  
+  - One other relevant observation is that we see that high perplexity filler tokens like normal non-repeating text don’t work as well as fully deterministic filler  
+    - The most likely explanation here seems like the model has an impulse to predict tokens, and when the prediction isn't dead easy, the model tries to do this and it takes up layers/bandwidth that the model would otherwise devote to problem answering.  
+    - This finding definitely lines up with that:  
+      - By disrupting filler tokens, you’re simply adding perplexity  
+      - Now the model is, to the extent it really is trying to predict what will come after each filler token, having to deal with the problem that it might not all be filler tokens  
+  - Part of my interest with this finding is related to what the model is doing differently with different amount of filler tokens  
+    - Is it always doing the same thing, just as many times as it can in the filler span?  
+    - Is it running different algorithms?  
+      - Is it running one algorithm the whole time but it depends on the input problem?  
+      - Is it running multiple different algorithms per input/filler span?  
+        - If so, how is it choosing between them?  
+          - Does it consider how many filler tokens it has to work with and applies a long/short algorithm accordingly?  
+          - Does it select randomly?  
+          - Does it do them all in parallel?  
+        - If it’s doing something complicated to select between algorithms, disrupting the filler should effect this  
+          - Disruptions like this experiment  
+          - Or others, like telling it it will have 100 filler tokens but giving it 50, or 150  
+            - (150 should probably do better than say-100-give-100 but worse than say-100-give-100)  
+- Some of the hypotheses I list above seem obsolete in light of the paper, but I just lited all the updates I could think of.
