@@ -3,12 +3,15 @@ import re
 import sys
 import copy
 import json
+import types
 
 import torch as t
+import torch.nn.functional as F
 from torch import Tensor
 from huggingface_hub import hf_hub_download
 from transformers import AutoTokenizer, DeepseekV4Config, DeepseekV4ForCausalLM
 from transformers.cache_utils import DynamicCache
+from transformers.models.deepseek_v4 import modeling_deepseek_v4 as mdv4
 from transformer_lens.model_bridge import TransformerBridge
 
 sys.path.append(os.path.dirname(hf_hub_download("deepseek-ai/DeepSeek-V4-Flash", "encoding/encoding_dsv4.py")))  # DeepSeek's prompt renderer (V4 has no chat template)
@@ -41,6 +44,33 @@ def tiny_bridge(seed: int = 0, device: str = "cpu") -> TransformerBridge:
     model.eval()
     model.requires_grad_(False)
     return model
+
+def _fp32_topk_forward(self, hidden_states: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    logits = F.linear(hidden_states.reshape(-1, self.hidden_dim).float(), self.weight.float())
+    scores = self.score_fn(logits)
+    indices = t.topk(scores + self.e_score_correction_bias.float(), self.top_k, dim=-1, sorted=False).indices
+    weights = scores.gather(1, indices)
+    return logits, weights / (weights.sum(dim=-1, keepdim=True) + 1e-20) * self.routed_scaling_factor, indices
+
+def _fp32_hash_forward(self, hidden_states: Tensor, input_ids: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    logits = F.linear(hidden_states.reshape(-1, self.hidden_dim).float(), self.weight.float())
+    indices = self.tid2eid[input_ids.reshape(-1)].long()
+    weights = self.score_fn(logits).gather(1, indices)
+    return logits, weights / (weights.sum(dim=-1, keepdim=True) + 1e-20) * self.routed_scaling_factor, indices
+
+def fp32_routers(model: TransformerBridge, on: bool = True):
+    """Route in fp32 as DeepSeek's reference inference/model.py does, or (on=False) restore HF's routing in the bf16 stream dtype. fp32 means fp32 router logits (the gate weight is stored in bf16, so the upcast is exact) and fp32 routing weights, so the 6 expert outputs are also weighted and summed in fp32 like the reference; the selection bias already loads in fp32. Patches each router instance; under a device_map, accelerate's hook calls the instance's _old_forward, so that is the slot replaced."""
+    for layer in model.original_model.model.layers:
+        gate = layer.mlp.gate.original_component
+        is_hash = isinstance(gate, mdv4.DeepseekV4HashRouter)
+        slot = "_old_forward" if hasattr(gate, "_old_forward") else "forward"
+        if not hasattr(gate, "hf_forward_"):
+            gate.hf_forward_ = getattr(gate, slot)
+        setattr(gate, slot, types.MethodType(_fp32_hash_forward if is_hash else _fp32_topk_forward, gate) if on else gate.hf_forward_)
+        x = t.zeros(1, 1, gate.hidden_dim, dtype=gate.weight.dtype, device=gate.weight.device)
+        logits = gate(x, t.zeros(1, 1, dtype=t.long, device=x.device))[0] if is_hash else gate(x)[0]
+        assert logits.dtype == (t.float32 if on else gate.weight.dtype), (slot, logits.dtype)
+        assert is_hash or gate.e_score_correction_bias.dtype == t.float32
 
 def edit_item(item: dict, x: int | None = None, k1: int | None = None, k2: int | None = None) -> dict:
     """The item with x's literal, y's constant k1 and/or the question's constant k2 replaced, and every value, the chain and the answer recomputed."""

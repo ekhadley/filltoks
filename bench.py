@@ -12,7 +12,7 @@ from transformers.cache_utils import DynamicCache
 from mechtools import *
 
 from prompts import parse_answer
-from utils import MODEL_ID, EOS, tiny_bridge, prompt_ids, answer_ids, prefill, tail_logits, decode, answer_logprob
+from utils import MODEL_ID, EOS, tiny_bridge, fp32_routers, prompt_ids, answer_ids, prefill, tail_logits, decode, answer_logprob
 
 t.set_grad_enabled(False)
 items = [json.loads(l) for l in open("data/eval.jsonl")]
@@ -26,6 +26,7 @@ model = tiny_bridge()
 # model = load_bridge(MODEL_ID)  # packed FP8 + FP4 experts, ~160 GB; needs `uv add kernels`
 # model = load_bridge(MODEL_ID, quantization_config=FineGrainedFP8Config(dequantize=True))  # bf16, ~569 GB
 # model = load_bridge(MODEL_ID, quantization_config=FineGrainedFP8Config(dequantize=True), max_memory={i: "76GiB" for i in range(8)})  # 8x H100: a layer is 12.3 GiB and unsplittable, so 72GiB spills to disk
+# fp32_routers(model)  # route in fp32 like DeepSeek's reference inference (HF routes in bf16)
 tok = model.tokenizer
 
 #%% Smoke test: parameter and stream dtypes, GPU memory, and the prefix-cache path against a plain full forward on a few items
