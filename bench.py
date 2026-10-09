@@ -1,6 +1,7 @@
 #%% Setup: data, model, tokenizer
 
 import csv
+import html
 import json
 import math
 from collections import Counter
@@ -169,3 +170,82 @@ if plot_flips:
         labels={"x": "P(correct) at 100 dots minus at 0 dots"},
         title="Per-item change in P(correct)",
     )
+
+#%% Dose sweep: exact P(correct answer + EOS) for every item at filler lengths 0, 5, ..., 100 (no decoding), one prefix cache per length; saves results/dose_{TAG}.json
+
+run_dose = True
+if run_dose:
+    ks = list(range(0, 101, 5))
+    n_items = 600
+    # n_items = 32
+    batch_size = 16
+    records = []
+    for k in ks:
+        pts = [prompt_ids(tok, shots, it, k) for it in items[:n_items]]
+        assert all(prefix == pts[0][0] for prefix, _ in pts)
+        cache = prefill(model, pts[0][0])
+        for i in pbar(range(0, n_items, batch_size), desc=f"k={k}"):
+            batch = items[i:min(i + batch_size, n_items)]
+            logp = answer_logprob(model, cache, [tail for _, tail in pts[i:i + batch_size]], [answer_ids(tok, it["answer"]) for it in batch])
+            records += [{"idx": it["idx"], "k": k, "logp": logp[j].item()} for j, it in enumerate(batch)]
+        done = [math.exp(r["logp"]) for r in records if r["k"] == k]
+        print(f"{cyan}k={k}: mean P(correct) {sum(done) / len(done):.3f}{endc}")
+        json.dump(records, open(f"results/dose_{TAG}.json", "w"))
+    print(f"{green}saved results/dose_{TAG}.json{endc}")
+
+#%% Dose curve for readers without context: mean P(correct) against the number of filler dots, for all questions and by the two multipliers, with 95% bootstrap intervals over questions; written to figs/dose_curve.html
+
+plot_dose = True
+if plot_dose:
+    n_boot = 5000
+    recs = json.load(open(f"results/dose_{TAG}.json"))
+    ks = sorted({r["k"] for r in recs})
+    idxs = sorted({r["idx"] for r in recs})
+    lp = {(r["idx"], r["k"]): r["logp"] for r in recs}
+    p = t.tensor([[math.exp(lp[(i, k)]) for k in ks] for i in idxs])  # [items, ks]
+    cc = t.tensor([[items[i]["chain"]["c1x"] // items[i]["chain"]["x"], items[i]["coefficient"]] for i in idxs])
+    lines = {"all questions": t.ones(len(idxs), dtype=t.bool), "×2 then ×2": (cc == 2).all(1), "×2 then ×3": (cc[:, 0] == 2) & (cc[:, 1] == 3), "×3 then ×2": (cc[:, 0] == 3) & (cc[:, 1] == 2), "×3 then ×3": (cc == 3).all(1)}
+    fig = go.Figure()
+    for (name, m), color in zip(lines.items(), ["#e8e6dc"] + SERIES):
+        pm = p[m]
+        boot = pm[t.randint(0, len(pm), (n_boot, len(pm)), generator=t.Generator().manual_seed(0))].mean(1)
+        lo, hi = boot.quantile(0.025, 0), boot.quantile(0.975, 0)
+        fig.add_trace(go.Scatter(x=ks + ks[::-1], y=hi.tolist() + lo.flip(0).tolist(), fill="toself", fillcolor=color, opacity=0.15, line={"width": 0}, hoverinfo="skip", showlegend=False))
+        fig.add_trace(go.Scatter(x=ks, y=pm.mean(0).tolist(), mode="lines+markers", line={"color": color, "width": 4 if name == "all questions" else 2}, name=f"{name} (n={m.sum().item()})"))
+    allp = p.mean(0)
+    fig.update_layout(
+        title=(
+            f"<b>How the chance of a correct answer grows with the number of filler dots</b>  DeepSeek V4 Flash, {len(idxs)} two-step arithmetic questions"
+            f"<br><span style='font-size:13px'>All questions: {allp[0]:.2f} with no filler, {allp[-1]:.2f} with {ks[-1]} dots. Each question is asked with k dots ('Filler: . . .') between the question and 'Answer:'; the prompt's 10 worked examples carry the same filler.</span>"
+            f"<br><span style='font-size:13px'>Example question (×3 then ×2): <i>{items[0]['x_name']} = {items[0]['chain']['x']} · {items[0]['queried_term']} = {dict(items[0]['definitions'])[items[0]['queried_term']]} · (3 more definitions) · {items[0]['question']}</i>  →  {items[0]['queried_term']} = {items[0]['chain']['y']}, answer = {items[0]['answer']}</span>"
+            "<br><span style='font-size:13px'>Probability of the correct answer: the model's probability of writing exactly the right number and stopping (its expected accuracy when sampling). Bands: 95% intervals from resampling questions.</span>"
+        ),
+        xaxis_title="number of filler dots",
+        yaxis_title="mean probability of the correct answer",
+        xaxis={"tickvals": ks},
+        yaxis_range=[0, 1],
+        height=700,
+        width=1400,
+        margin={"t": 170},
+        legend={"title": "questions (multipliers in the two steps)"},
+        **DARK,
+    )
+    write_dark_html(fig, "figs/dose_curve.html")
+    print(f"{green}wrote figs/dose_curve.html{endc}")
+    for name, m in lines.items():
+        print(f"{name:14s} " + " ".join(f"{k}:{v:.2f}" for k, v in zip(ks, p[m].mean(0).tolist())))
+
+#%% The full prompt as the model sees it, one box per token (hover for position, id and repr), the token where the answer is read outlined; written to figs/prompt_k{k}.html
+
+save_prompt_html = True
+if save_prompt_html:
+    k = 10
+    # k = 0
+    # k = 100
+    item = items[0]
+    prefix, tail = prompt_ids(tok, shots, item, k)
+    ids = prefix + tail
+    head = f"Prompt for question {item['idx']} with {k} filler dots: {len(ids)} tokens ({len(prefix)} shared by every question: system prompt and 10 worked examples; {len(tail)} for this question). The outlined last token is where the model's answer is read; the correct answer is {item['answer']}."
+    strip = toks_html([tok.decode([i]) for i in ids], ids, len(ids) - 1)
+    open(f"figs/prompt_k{k}.html", "w").write(f"<!doctype html><html><head><meta charset='utf-8'><title>Prompt, {k} dots</title><style>html, body {{ background: #111; margin: 0; }}</style></head><body><div style='background:#111;color:#ddd;font:12px monospace;padding:8px'><div style='margin-bottom:6px;font-weight:bold'>{html.escape(head)}</div>{strip}</div></body></html>")
+    print(f"{green}wrote figs/prompt_k{k}.html ({len(ids)} tokens){endc}")

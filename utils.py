@@ -93,6 +93,21 @@ def edit_item(item: dict, x: int | None = None, k1: int | None = None, k2: int |
     edited = {k: v for k, v in item.items() if k not in ("distractors", "rivals")}  # stale after an edit
     return {**edited, "definitions": defs, "values": vals, "queried_value": y, "constant": k2, "question": re.sub(r"\d+\?$", f"{k2}?", item["question"]), "answer": answer, "chain": chain}
 
+def with_coefs(item: dict, c1: int, c2: int) -> dict:
+    """The item with y's coefficient set to c1 and the question's to c2 (x, both constants and every other definition unchanged), and y, the chain and the answer recomputed."""
+    word = {2: "twice", 3: "three times", 4: "four times", 5: "five times"}
+    q, x = item["queried_term"], item["chain"]["x"]
+    m = EXPR.fullmatch(dict(item["definitions"])[q])
+    assert m[2] == item["x_name"]
+    defs = [[name, f"{word[c1]} the number for {m[2]} {m[3]} {m[4]}" if name == q else v] for name, v in item["definitions"]]
+    question, n = re.subn(r"^What is (twice|three times) ", f"What is {word[c2]} ", item["question"])
+    assert n == 1, item["question"]
+    y = c1 * x + SIGN[m[3]] * int(m[4])
+    answer = c2 * y + SIGN[item["operation"]] * item["constant"]
+    chain = {"x": x, "c1x": c1 * x, "y": y, "c2y": c2 * y, "answer": answer}
+    kept = {k: v for k, v in item.items() if k not in ("values", "distractors", "rivals")}  # stale after the edit
+    return {**kept, "definitions": defs, "coefficient": c2, "queried_value": y, "question": question, "answer": answer, "chain": chain}
+
 def donors(item: dict, x: int, k1: int, k2: int) -> dict[str, dict]:
     """The four donor items for one (x', k1', k2') draw: the main x+k2 donor and the x-, k1- and k2-only controls."""
     return {"xk2": edit_item(item, x=x, k2=k2), "x": edit_item(item, x=x), "k1": edit_item(item, k1=k1), "k2": edit_item(item, k2=k2)}
