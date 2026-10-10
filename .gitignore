@@ -12,3 +12,14 @@ wheels/
 # docs
 CLAUDE.md
 research_guidelines.md
+
+# Greenblatt compose_facts pool and the 1-fact sets built from it (not to be republished)
+data/facts/
+
+# lens dumps over GitHub's 100 MB file limit (kept locally and on the box)
+results/lens_v4flash_packed.pt
+results/lens_coef_v4flash_packed.pt
+results/lens_coef_v4flash_packed_k100.pt
+
+# fact-retrieval results carry the shots and known facts (questions and answers) from the pool
+results/facts_known_*.json

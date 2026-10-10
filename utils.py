@@ -3,7 +3,10 @@ import re
 import sys
 import copy
 import json
+import random
+import functools
 import types
+from contextlib import contextmanager
 
 import torch as t
 import torch.nn.functional as F
@@ -17,7 +20,7 @@ from transformer_lens.model_bridge import TransformerBridge
 sys.path.append(os.path.dirname(hf_hub_download("deepseek-ai/DeepSeek-V4-Flash", "encoding/encoding_dsv4.py")))  # DeepSeek's prompt renderer (V4 has no chat template)
 from encoding_dsv4 import encode_messages
 
-from prompts import build_messages
+from prompts import build_messages, make_filler
 
 MODEL_ID = "deepseek-ai/DeepSeek-V4-Flash"
 EOS = 1  # <｜end▁of▁sentence｜>
@@ -123,9 +126,33 @@ def valid_donors(item: dict, dons: dict[str, dict], min_gap: int = 5) -> bool:
     non_negative = all(min(d["values"].values()) >= 0 for d in dons.values())
     return non_negative and 0 <= nums[0] and nums[-1] < 1000 and min(b - a for a, b in zip(nums, nums[1:])) >= min_gap and shown.isdisjoint(nums)
 
-def prompt_ids(tok, shots: list[dict], item: dict, k: int) -> tuple[list[int], list[int]]:
-    """Olivia's k-dot prompt as (shared prefix: system + few-shot turns, item tail: last user turn + '<｜Assistant｜></think>')."""
-    text = encode_messages(build_messages(shots, item, "dots", k), thinking_mode="chat")
+def counting_text(seed: int) -> str:
+    """2,500 integers (about 7,500 tokens) counted up or down from a random start below 10,000, both drawn from the seed; it may pass zero."""
+    rng = random.Random(seed)
+    start, step = rng.randrange(10000), rng.choice([1, -1])
+    return " ".join(str(start + step * i) for i in range(2500))
+
+def random_ints_text(seed: int) -> str:
+    """2,500 independent random integers from 1 to 1000 (about 5,000 tokens), drawn from the seed."""
+    rng = random.Random(seed)
+    return " ".join(str(rng.randint(1, 1000)) for _ in range(2500))
+
+TEXT_FILLER = {"wiki": lambda seed: open("data/wiki_filler.txt").read(), "count": counting_text, "rand": random_ints_text}  # 'wiki': the English Wikipedia article 'Tree' on one line, 2500 tokens, the same for every seed
+
+@functools.lru_cache
+def text_filler(tok, text: str, k: int) -> str:
+    """A prefix of text cut at the token count whose filler line comes closest to k positions (its closing '\n\n' included, as the last dot's is): exact for prose, k or k ± 1 for counting, where a cut ending in digits costs one position more than one ending in a space."""
+    ids = tok(text, add_special_tokens=False).input_ids
+    n_line = lambda f: len(tok(f"Filler: {f}\n\nAnswer:", add_special_tokens=False).input_ids) - len(tok("Filler:\n\nAnswer:", add_special_tokens=False).input_ids)
+    f = min((tok.decode(ids[:n]) for n in range(max(k - 3, 0), k + 1)), key=lambda f: abs(n_line(f) - k)) if k else ""
+    assert abs(n_line(f) - k) <= 1, (text[:20], k, n_line(f))
+    return f
+
+def prompt_ids(tok, shots: list[dict], item: dict, k: int, kind: str = "dots", before: tuple[str, int] | None = None) -> tuple[list[int], list[int]]:
+    """Olivia's k-filler prompt as (shared prefix: system + few-shot turns, item tail: last user turn + '<｜Assistant｜></think>'). kind 'dots', or a TEXT_FILLER kind cut to k tokens: shot s is seeded with -1 - s and the item with its idx. before = (kind, k) adds a second filler above the definitions."""
+    seeds = [-1 - s for s in range(len(shots))] + [item["idx"]]
+    strings = lambda kind, k: [make_filler(kind, k)] * len(seeds) if kind == "dots" else [text_filler(tok, TEXT_FILLER[kind](seed), k) for seed in seeds]
+    text = encode_messages(build_messages(shots, item, fillers=strings(kind, k), befores=strings(*before) if before else None), thinking_mode="chat")
     cut = text.rindex("<｜User｜>")
     prefix, tail = (tok(s, add_special_tokens=False).input_ids for s in (text[:cut], text[cut:]))
     assert prefix + tail == tok(text, add_special_tokens=False).input_ids
@@ -149,12 +176,56 @@ def regions(tok, tail: list[int], k: int) -> dict[str, list[int]]:
     assert text["post"] == "Answer:<｜Assistant｜>" and text["last"] == "</think>" and text["q_line"].startswith("Question:"), text
     return reg
 
+def seeded_prompt(tok, shots: list[dict], item: dict, k: int, placement: str, per_block: int = 4) -> tuple[list[int], list[int], dict[str, list]]:
+    """The k-dot prompt with one block of per_block random three-digit integers per dot (2 tokens each: ' ', 'ddd'), drawn from the item's idx, in the item's turn only (the shots carry plain dots). placement 'before': the blocks on a 'Filler:' line above the definitions, led by pad dots so that block 0 starts at an absolute position that is a multiple of 8 (then CSA entry 2i + 1 pools exactly block i); 'inline': each block just before its dot on the filler line; 'plain': no blocks. Returns prefix, tail and positions: 'blocks' (k lists), 'pad', 'filler' (the dots) and 'ctx' (every other tail position)."""
+    rng = random.Random(item["idx"])
+    ints = [[rng.randint(100, 999) for _ in range(per_block)] for _ in range(k)]
+    prefix = prompt_ids(tok, shots, item, k)[0]
+    n_pad = (-(len(prefix) + 4)) % 8 if placement == "before" else 0  # the before line starts '<｜User｜>', 'F', 'iller', ':'
+    plain = [make_filler("dots", k)] * (len(shots) + 1)
+    kw = {
+        "plain": {},
+        "before": {"befores": [""] * len(shots) + [" ".join(["."] * n_pad + [str(n) for b in ints for n in b])]},
+        "inline": {"fillers": plain[:-1] + [" ".join(" ".join(map(str, b)) + " ." for b in ints)]},
+    }[placement]
+    text = encode_messages(build_messages(shots, item, "dots", k, **kw), thinking_mode="chat")
+    tail = tok(text[text.rindex("<｜User｜>"):], add_special_tokens=False).input_ids
+    T, w = len(tail), 2 * per_block
+    if placement == "inline":
+        units = [list(range(T - 4 - (w + 1) * k + (w + 1) * i, T - 4 - (w + 1) * k + (w + 1) * i + w + 1)) for i in range(k)]
+        blocks, dots, pad = [u[:-1] for u in units], [u[-1] for u in units], []
+    else:
+        blocks = [list(range(4 + n_pad + w * i, 4 + n_pad + w * (i + 1))) for i in range(k)] if placement == "before" else []
+        dots, pad = list(range(T - 4 - k, T - 4)), list(range(4, 4 + n_pad))
+    for b, nums in zip(blocks, ints):
+        assert tok.decode([tail[p] for p in b]) == "".join(f" {n}" for n in nums), (placement, b)
+    assert all(tok.decode([tail[p]]).startswith(" .") for p in dots) and tok.decode([tail[p] for p in pad]) == " ." * n_pad
+    used = {p for b in blocks for p in b} | set(dots) | set(pad)
+    return prefix, tail, {"blocks": blocks, "pad": pad, "filler": dots, "ctx": [p for p in range(T) if p not in used]}
+
+def seed_cond(see: str, alone: bool):
+    """Knockout marker for seeded_prompt layouts: see 'none' hides every block (and the pad) from every position, 'own' hides all but its own block from each dot and every block from the other positions, 'all' hides nothing; alone also hides the earlier dots from each dot. Unless 'all', a block's tokens see only their own block and the context (not other blocks, the pad or the dots), so each block is an independent seed."""
+    def mark(m: Tensor, reg: dict):
+        blk = [p for b in reg["blocks"] for p in b] + reg["pad"]
+        if see != "all" and blk:
+            m[t.tensor(reg["ctx"])[:, None], t.tensor(blk)[None, :]] = True
+            for i, d in enumerate(reg["filler"]):
+                m[d, [p for p in blk if see == "none" or p not in reg["blocks"][i]]] = True
+            for b in reg["blocks"]:
+                m[t.tensor(b)[:, None], t.tensor([p for p in blk if p not in b] + reg["filler"])[None, :]] = True
+        if alone:
+            d = t.tensor(reg["filler"])
+            m[d[:, None], d[None, :]] |= d[None, :] < d[:, None]
+    return mark
+
 def answer_ids(tok, n: int) -> list[int]:
     return tok(str(n), add_special_tokens=False).input_ids
 
-def prefill(model: TransformerBridge, ids: list[int]) -> DynamicCache:
+def prefill(model: TransformerBridge, ids: list[int], chunk: int = 2048) -> DynamicCache:
+    """Batch-1 cache of ids, fed in chunks: the bridge forces eager attention, whose [T, T] scores take 15 GB at the 11k-token prefix of k = 1000."""
     cache = DynamicCache(config=model.original_model.config)
-    model(t.tensor([ids], device=model.cfg.device), past_key_values=cache, use_cache=True, logits_to_keep=1)
+    for i in range(0, len(ids), chunk):
+        model(t.tensor([ids[i:i + chunk]], device=model.cfg.device), past_key_values=cache, use_cache=True, logits_to_keep=1)
     return cache
 
 def expand_cache(cache: DynamicCache, n: int) -> DynamicCache:
@@ -222,3 +293,43 @@ def transplant(model: TransformerBridge, prefix_cache: DynamicCache, src_tails: 
     S = scope_S(len(src_tails), scopes, model.cfg.n_layers, len(src_tails[0]))
     rows = src_tails + [src_tails[0]] * len(scopes)
     return tail_logits(model, prefix_cache, rows, source_hooks(S))[:, -1].log_softmax(-1)
+
+_KNOCKOUT = None  # (blocked [B, T, T] bool over tail positions, prefix length, keep_mixed_hca) while a knockout forward runs
+_eager_attention = mdv4.eager_attention_forward
+
+def _eager_knockout(module, query, key, value, attention_mask, scaling, **kwargs):
+    """eager_attention_forward with tail query i blocked from tail key j wherever blocked[b, i, j]: in the exact sliding window and in every pooled CSA/HCA entry covering key j (an HCA entry that also covers unblocked keys stays visible when keep_mixed_hca)."""
+    if _KNOCKOUT is not None:
+        blocked, past, keep_mixed_hca = _KNOCKOUT
+        B, T, _ = blocked.shape
+        sl = min(past, module.sliding_window - 1) + T  # exact-window keys: the cached prefix rows, then the tail
+        csa, hca = module.layer_type == "compressed_sparse_attention", module.layer_type == "heavily_compressed_attention"
+        rate = module.config.compress_rates[module.layer_type] if csa or hca else 1
+        n_ent = (past + T) // rate * (csa or hca)
+        assert attention_mask.shape[-2:] == (T, sl + n_ent), (attention_mask.shape, T, sl, n_ent)
+        cs = F.pad(blocked.int().cumsum(-1), (1, 0))  # cs[b, i, p]: blocked keys of query i among tail positions < p
+        e = t.arange(n_ent)
+        lo, hi = (rate * (e - int(csa)) - past).clamp(0, T), (rate * (e + 1) - past).clamp(0, T)  # tail positions covered by entry e (a CSA entry also pools the window before its own)
+        n_blocked = cs[..., hi] - cs[..., lo]
+        ent = (n_blocked == hi - lo) & (hi > lo) if hca and keep_mixed_hca else n_blocked > 0
+        full = t.cat([blocked.new_zeros(B, T, sl - T), blocked, ent], -1)[:, None].to(attention_mask.device)
+        attention_mask = attention_mask.expand(B, -1, -1, -1).masked_fill(full, t.finfo(attention_mask.dtype).min)
+    return _eager_attention(module, query, key, value, attention_mask, scaling, **kwargs)
+mdv4.eager_attention_forward = _eager_knockout
+
+@contextmanager
+def knockout(blocked: Tensor, past: int, keep_mixed_hca: bool = False):
+    """Forwards inside the block (rows continuing a `past`-token prefix cache) run with tail query i unable to attend to tail key j wherever blocked[b, i, j], at every layer."""
+    global _KNOCKOUT
+    _KNOCKOUT = (blocked, past, keep_mixed_hca)
+    try:
+        yield
+    finally:
+        _KNOCKOUT = None
+
+def blocked_rows(regs: list[dict], T: int, cond) -> Tensor:
+    """[B, T, T] bool, query i may not see key j: cond(m, reg) marks row b's matrix from its regions."""
+    m = t.zeros(len(regs), T, T, dtype=t.bool)
+    for b, reg in enumerate(regs):
+        cond(m[b], reg)
+    return m

@@ -171,27 +171,34 @@ if plot_flips:
         title="Per-item change in P(correct)",
     )
 
-#%% Dose sweep: exact P(correct answer + EOS) for every item at filler lengths 0, 5, ..., 100 (no decoding), one prefix cache per length; saves results/dose_{TAG}.json
+#%% Dose sweep: exact P(correct answer + EOS) for every item at filler lengths 0, 5, ..., 100 (no decoding), one prefix cache per length; saves results/dose_{TAG}.json (the commented `runs` lines are the long, text-filler and placement variants)
 
 run_dose = True
 if run_dose:
-    ks = list(range(0, 101, 5))
+    runs = [("dots", False, list(range(0, 101, 5)), f"results/dose_{TAG}.json")]  # (filler kind, filler before the question, ks, output)
+    # runs = [("dots", False, [200, 500, 1000], f"results/dose_long_{TAG}.json")]  # the long-filler extension: the whole question leaves the exact 128-token window past about 120 dots
+    # runs = [("wiki", False, [0, 10, 20, 50, 100, 200, 500, 1000, 2000], f"results/dose_wiki_{TAG}.json")]  # k tokens of Wikipedia text instead of k dots (utils.TEXT_FILLER)
+    # runs = [("count", False, [0, 10, 20, 50, 100, 200, 500, 1000, 2000], f"results/dose_count_{TAG}.json")]  # k tokens of counting from a random start, a different sequence per question and shot
+    # runs = [("rand", False, [0, 10, 100], f"results/dose_rand_{TAG}.json"), ("rand", "k", [10, 100], f"results/dose_rand_before_{TAG}.json"), ("dots", "k", [10, 100], f"results/dose_before_{TAG}.json")]  # random integers 1..1000 after the question; then random integers and dots before the question ("k": the swept length goes above the definitions, nothing after the question; at k = 0 the placements share a prompt)
+    # runs = [("wiki", "k", [10, 100], f"results/dose_wiki_before_{TAG}.json"), ("count", "k", [10, 100], f"results/dose_count_before_{TAG}.json")]  # Wikipedia text and counting before the question
+    # runs = [("dots", (b, n), [0, 10, 100], f"results/dose_{b}_before{n}_dots_{TAG}.json") for n in [10, 100] for b in ["wiki", "count", "rand"]]  # n tokens of Wikipedia text, counting or random integers above the definitions plus 0, 10 or 100 dots after the question
     n_items = 600
     # n_items = 32
-    batch_size = 16
-    records = []
-    for k in ks:
-        pts = [prompt_ids(tok, shots, it, k) for it in items[:n_items]]
-        assert all(prefix == pts[0][0] for prefix, _ in pts)
-        cache = prefill(model, pts[0][0])
-        for i in pbar(range(0, n_items, batch_size), desc=f"k={k}"):
-            batch = items[i:min(i + batch_size, n_items)]
-            logp = answer_logprob(model, cache, [tail for _, tail in pts[i:i + batch_size]], [answer_ids(tok, it["answer"]) for it in batch])
-            records += [{"idx": it["idx"], "k": k, "logp": logp[j].item()} for j, it in enumerate(batch)]
-        done = [math.exp(r["logp"]) for r in records if r["k"] == k]
-        print(f"{cyan}k={k}: mean P(correct) {sum(done) / len(done):.3f}{endc}")
-        json.dump(records, open(f"results/dose_{TAG}.json", "w"))
-    print(f"{green}saved results/dose_{TAG}.json{endc}")
+    for kind, before, ks, out in runs:
+        records = []
+        for k in ks:
+            batch_size = 16 if k <= 100 else 8 if k <= 500 else 2 if k <= 1000 else 1  # the CSA branch scores every pooled entry before its top-512 cut: about k keys per query
+            pts = [prompt_ids(tok, shots, it, 0, kind, (kind, k)) if before == "k" else prompt_ids(tok, shots, it, k, kind, before) for it in items[:n_items]]
+            assert all(prefix == pts[0][0] for prefix, _ in pts)
+            cache = prefill(model, pts[0][0], chunk=1024)
+            for i in pbar(range(0, n_items, batch_size), desc=f"{kind} {before} k={k}"):
+                batch = items[i:min(i + batch_size, n_items)]
+                logp = answer_logprob(model, cache, [tail for _, tail in pts[i:i + batch_size]], [answer_ids(tok, it["answer"]) for it in batch])
+                records += [{"idx": it["idx"], "k": k, "logp": logp[j].item()} for j, it in enumerate(batch)]
+            done = [math.exp(r["logp"]) for r in records if r["k"] == k]
+            print(f"{cyan}{kind} {before} k={k}: mean P(correct) {sum(done) / len(done):.3f}{endc}")
+            json.dump(records, open(out, "w"))
+        print(f"{green}saved {out}{endc}")
 
 #%% Dose curve for readers without context: mean P(correct) against the number of filler dots, for all questions and by the two multipliers, with 95% bootstrap intervals over questions; written to figs/dose_curve.html
 
@@ -234,6 +241,186 @@ if plot_dose:
     print(f"{green}wrote figs/dose_curve.html{endc}")
     for name, m in lines.items():
         print(f"{name:14s} " + " ".join(f"{k}:{v:.2f}" for k, v in zip(ks, p[m].mean(0).tolist())))
+
+#%% Long-filler dose curve for readers without context: mean P(correct) at 0 to 1000 dots (the 0..100 sweep plus results/dose_long_{TAG}.json), evenly spaced ticks, all questions and by multipliers, with 95% bootstrap intervals; written to figs/dose_curve_long.html
+
+plot_dose_long = True
+if plot_dose_long:
+    n_boot = 5000
+    show_ks = [0, 10, 25, 50, 100, 200, 500, 1000]
+    recs = json.load(open(f"results/dose_{TAG}.json")) + json.load(open(f"results/dose_long_{TAG}.json"))
+    idxs = sorted({r["idx"] for r in recs})
+    lp = {(r["idx"], r["k"]): r["logp"] for r in recs}
+    p = t.tensor([[math.exp(lp[(i, k)]) for k in show_ks] for i in idxs])  # [items, ks]
+    cc = t.tensor([[items[i]["chain"]["c1x"] // items[i]["chain"]["x"], items[i]["coefficient"]] for i in idxs])
+    lines = {"all questions": t.ones(len(idxs), dtype=t.bool), "×2 then ×2": (cc == 2).all(1), "×2 then ×3": (cc[:, 0] == 2) & (cc[:, 1] == 3), "×3 then ×2": (cc[:, 0] == 3) & (cc[:, 1] == 2), "×3 then ×3": (cc == 3).all(1)}
+    xs = [str(k) for k in show_ks]
+    fig = go.Figure()
+    for (name, m), color in zip(lines.items(), ["#e8e6dc"] + SERIES):
+        pm = p[m]
+        boot = pm[t.randint(0, len(pm), (n_boot, len(pm)), generator=t.Generator().manual_seed(0))].mean(1)
+        lo, hi = boot.quantile(0.025, 0), boot.quantile(0.975, 0)
+        fig.add_trace(go.Scatter(x=xs + xs[::-1], y=hi.tolist() + lo.flip(0).tolist(), fill="toself", fillcolor=color, opacity=0.15, line={"width": 0}, hoverinfo="skip", showlegend=False))
+        fig.add_trace(go.Scatter(x=xs, y=pm.mean(0).tolist(), mode="lines+markers", line={"color": color, "width": 4 if name == "all questions" else 2}, name=f"{name} (n={m.sum().item()})"))
+    allp = p.mean(0)
+    fig.update_layout(
+        title=(
+            f"<b>Does the chance of a correct answer keep growing with more filler dots?</b>  DeepSeek V4 Flash, {len(idxs)} two-step arithmetic questions, 0 to 1000 dots"
+            f"<br><span style='font-size:13px'>All questions: {allp[0]:.2f} with no filler, {allp[show_ks.index(100)]:.2f} with 100 dots, {allp[-1]:.2f} with 1000. Each question is asked with k dots ('Filler: . . .') between the question and 'Answer:'; the prompt's 10 worked examples carry the same filler, so the prompt is about 11,000 tokens at 1000 dots.</span>"
+            "<br><span style='font-size:13px'>The model attends exactly over a 128-token window and through pooled summaries beyond it, so past about 120 dots the question is reachable from the answer only through the summaries.</span>"
+            "<br><span style='font-size:13px'>Probability of the correct answer: the model's probability of writing exactly the right number and stopping (its expected accuracy when sampling). Bands: 95% intervals from resampling questions. The x axis is evenly spaced, not to scale.</span>"
+        ),
+        xaxis_title="number of filler dots",
+        yaxis_title="mean probability of the correct answer",
+        xaxis={"type": "category"},
+        yaxis_range=[0, 1],
+        height=700,
+        width=1400,
+        margin={"t": 170},
+        legend={"title": "questions (multipliers in the two steps)"},
+        **DARK,
+    )
+    write_dark_html(fig, "figs/dose_curve_long.html")
+    print(f"{green}wrote figs/dose_curve_long.html{endc}")
+    for name, m in lines.items():
+        print(f"{name:14s} " + " ".join(f"{k}:{v:.2f}" for k, v in zip(show_ks, p[m].mean(0).tolist())))
+
+#%% Text-filler dose curves for readers without context: for each text filler kind (Wikipedia text, counting), mean P(correct) at 0 to 2000 filler tokens (results/dose_{kind}_{TAG}.json), evenly spaced ticks, all questions and by multipliers, with 95% bootstrap intervals, plus the all-questions curves of the other filler kinds for comparison; written to figs/dose_curve_{kind}.html
+
+plot_dose_text = True
+if plot_dose_text:
+    n_boot = 5000
+    kinds = {"wiki": "Wikipedia text", "count": "counting"}
+    describe = {
+        "wiki": "the first k tokens of the Wikipedia article 'Tree' ('Filler: In botany, a tree is a perennial plant ...'); the prompt's 10 worked examples carry the same text",
+        "count": "k tokens of integers counted up or down from a random start below 10,000 ('Filler: 6311 6310 6309 ...'), a different sequence for every question and for each of the prompt's 10 worked examples",
+    }
+    recs = {kind: json.load(open(f"results/dose_{kind}_{TAG}.json")) for kind in kinds}
+    recs["dots"] = json.load(open(f"results/dose_{TAG}.json")) + json.load(open(f"results/dose_long_{TAG}.json"))
+    lp = {kind: {(r["idx"], r["k"]): r["logp"] for r in rs} for kind, rs in recs.items()}
+    for kind, label in kinds.items():
+        show_ks = sorted({k for _, k in lp[kind]})
+        idxs = sorted({i for i, _ in lp[kind]})
+        p = t.tensor([[math.exp(lp[kind][(i, k)]) for k in show_ks] for i in idxs])  # [items, ks]
+        cc = t.tensor([[items[i]["chain"]["c1x"] // items[i]["chain"]["x"], items[i]["coefficient"]] for i in idxs])
+        lines = {"all questions": t.ones(len(idxs), dtype=t.bool), "×2 then ×2": (cc == 2).all(1), "×2 then ×3": (cc[:, 0] == 2) & (cc[:, 1] == 3), "×3 then ×2": (cc[:, 0] == 3) & (cc[:, 1] == 2), "×3 then ×3": (cc == 3).all(1)}
+        xs = [str(k) for k in show_ks]
+        fig = go.Figure()
+        for (name, m), color in zip(lines.items(), ["#e8e6dc"] + SERIES):
+            pm = p[m]
+            boot = pm[t.randint(0, len(pm), (n_boot, len(pm)), generator=t.Generator().manual_seed(0))].mean(1)
+            lo, hi = boot.quantile(0.025, 0), boot.quantile(0.975, 0)
+            fig.add_trace(go.Scatter(x=xs + xs[::-1], y=hi.tolist() + lo.flip(0).tolist(), fill="toself", fillcolor=color, opacity=0.15, line={"width": 0}, hoverinfo="skip", showlegend=False))
+            fig.add_trace(go.Scatter(x=xs, y=pm.mean(0).tolist(), mode="lines+markers", line={"color": color, "width": 4 if name == "all questions" else 2}, name=f"{name} (n={m.sum().item()})"))
+        for other, dash in zip([o for o in lp if o != kind], ["dash", "dot"]):
+            op = t.tensor([[math.exp(lp[other][(i, k)]) if (i, k) in lp[other] else math.nan for k in show_ks] for i in idxs]).nanmean(0)
+            fig.add_trace(go.Scatter(x=xs, y=op.tolist(), mode="lines+markers", line={"color": "#e8e6dc", "width": 2, "dash": dash}, name=f"all questions, {kinds.get(other, 'dots')} as filler instead"))
+            print(f"{kinds.get(other, 'dots'):14s} " + " ".join(f"{k}:{v:.2f}" for k, v in zip(show_ks, op.tolist())))
+        allp = p.mean(0)
+        fig.update_layout(
+            title=(
+                f"<b>Does {label} work as filler the way dots do?</b>  DeepSeek V4 Flash, {len(idxs)} two-step arithmetic questions, 0 to {show_ks[-1]} tokens of {label}"
+                f"<br><span style='font-size:13px'>All questions: {allp[0]:.2f} with no filler, {allp[show_ks.index(100)]:.2f} with 100 tokens, {allp[-1]:.2f} with {show_ks[-1]}. Each question is asked with {describe[kind]} between the question and 'Answer:'.</span>"
+                "<br><span style='font-size:13px'>The dashed and dotted lines are the same measurement with other fillers. The model attends exactly over a 128-token window and through pooled summaries beyond it, so past about 120 filler tokens the question is reachable from the answer only through the summaries.</span>"
+                "<br><span style='font-size:13px'>Probability of the correct answer: the model's probability of writing exactly the right number and stopping (its expected accuracy when sampling). Bands: 95% intervals from resampling questions. The x axis is evenly spaced, not to scale.</span>"
+            ),
+            xaxis_title="number of filler tokens",
+            yaxis_title="mean probability of the correct answer",
+            xaxis={"type": "category"},
+            yaxis_range=[0, 1],
+            height=700,
+            width=1400,
+            margin={"t": 170},
+            legend={"title": "questions (multipliers in the two steps)"},
+            **DARK,
+        )
+        write_dark_html(fig, f"figs/dose_curve_{kind}.html")
+        print(f"{green}wrote figs/dose_curve_{kind}.html{endc}")
+        for name, m in lines.items():
+            print(f"{name:14s} " + " ".join(f"{k}:{v:.2f}" for k, v in zip(show_ks, p[m].mean(0).tolist())))
+
+#%% Filler placement and random integers for readers without context: mean P(correct) over all questions at 10 and 100 filler tokens for each filler kind (dots, Wikipedia text, counting, random integers), after the question and, for dots and random integers, before it, plus 10 or 100 tokens of Wikipedia text, counting or random integers before the question combined with 0, 10 or 100 dots after it; 95% bootstrap intervals and the no-filler level as a line; written to figs/filler_position.html
+
+plot_position = True
+if plot_position:
+    n_boot = 5000
+    files = {  # (kind label, before) -> results file
+        ("dots", False): f"results/dose_{TAG}.json", ("Wikipedia text", False): f"results/dose_wiki_{TAG}.json", ("counting", False): f"results/dose_count_{TAG}.json",
+        ("random integers", False): f"results/dose_rand_{TAG}.json", ("dots", True): f"results/dose_before_{TAG}.json", ("Wikipedia text", True): f"results/dose_wiki_before_{TAG}.json",
+        ("counting", True): f"results/dose_count_before_{TAG}.json", ("random integers", True): f"results/dose_rand_before_{TAG}.json",
+    }
+    combined = {f"{n} {name} before the question,<br>dots after the question": (f"results/dose_{kind}_before{n}_dots_{TAG}.json", n) for n in [10, 100] for kind, name in [("wiki", "Wikipedia tokens"), ("count", "counting tokens"), ("rand", "random integers")]}  # the k=0 run is the before-filler alone, drawn in the 'n before' slot
+    lp = {key: {(r["idx"], r["k"]): r["logp"] for r in json.load(open(f))} for key, f in files.items()}
+    lp.update({(label, False): {(r["idx"], r["k"]): r["logp"] for r in json.load(open(f)) if r["k"] > 0} for label, (f, n) in combined.items()})
+    lp.update({(label, True): {(r["idx"], n): r["logp"] for r in json.load(open(f)) if r["k"] == 0} for label, (f, n) in combined.items()})
+    idxs = sorted({i for i, _ in lp[("dots", False)]})
+    p = {(key, k): t.tensor([math.exp(lp[key][(i, k)]) for i in idxs]) for key in lp for k in [10, 100] if (idxs[0], k) in lp[key]}
+    p0 = t.tensor([math.exp(lp[("dots", False)][(i, 0)]) for i in idxs]).mean().item()
+    kinds = ["dots", "Wikipedia text", "counting", "random integers", *combined]
+    conds = {"10 tokens after the question": (10, False), "100 tokens after the question": (100, False), "10 tokens before the question": (10, True), "100 tokens before the question": (100, True)}
+    unit = {"dots": "dots", "Wikipedia text": "tokens of Wikipedia text", "counting": "tokens of counting", "random integers": "tokens of random integers"}
+    def describe(kind: str, k: int, before: bool) -> str:
+        if kind in combined:
+            return kind.split(",")[0] + (", no dots after the question" if before else f", {k} dots after the question")
+        return f"{k} {unit[kind]} {'before' if before else 'after'} the question, nothing {'after' if before else 'before'} it"
+    fig = go.Figure()
+    for (name, (k, before)), color in zip(conds.items(), SERIES):
+        ys, err = [], []
+        for kind in kinds:
+            pm = p[((kind, before), k)] if ((kind, before), k) in p else t.tensor([math.nan])
+            boot = pm[t.randint(0, len(pm), (n_boot, len(pm)), generator=t.Generator().manual_seed(0))].mean(1)
+            ys.append(round(pm.mean().item(), 4)), err.append(round(((boot.quantile(0.975) - boot.quantile(0.025)) / 2).item(), 4))
+        fig.add_trace(go.Bar(x=kinds, y=ys, error_y={"type": "data", "array": err, "color": "#e8e6dc", "thickness": 1}, marker_color=color, name=name, hovertext=[describe(kind, k, before) for kind in kinds], hovertemplate="%{hovertext}<br>mean P(correct) %{y:.4f} ± %{error_y.array:.4f}<extra></extra>"))
+    fig.add_hline(y=p0, line={"color": "#e8e6dc", "dash": "dot", "width": 1.5}, annotation_text=f"no filler {p0:.2f}", annotation_position="top left")
+    fig.update_layout(
+        title=(
+            f"<b>Which fillers help, and do they help only after the question?</b>  DeepSeek V4 Flash, {len(idxs)} two-step arithmetic questions"
+            "<br><span style='font-size:13px'>Each question is asked with k filler tokens on a 'Filler:' line, either between the question and 'Answer:' (after) or above the variable definitions (before, with an empty 'Filler:' line kept before 'Answer:'); the prompt's 10 worked examples carry the same filler kind and placement.</span>"
+            "<br><span style='font-size:13px'>Fillers: dots ('. . .'), the Wikipedia article 'Tree', integers counted up or down from a random start below 10,000, independent random integers from 1 to 1000 (counting and random integers differ for every question and example). Text fillers are cut to k tokens (±1).</span>"
+            "<br><span style='font-size:13px'>The right-hand groups keep 10 or 100 tokens of Wikipedia text, counting or random integers above the definitions in every prompt and add 0 (the 'before the question' bar of that length), 10 or 100 dots after the question.</span>"
+            "<br><span style='font-size:13px'>Probability of the correct answer: the model's probability of writing exactly the right number and stopping (its expected accuracy when sampling). Error bars: 95% intervals from resampling questions. Missing bars were not run.</span>"
+        ),
+        barmode="group",
+        xaxis_title="filler kind",
+        yaxis_title="mean probability of the correct answer",
+        yaxis_range=[0, 1.02],
+        height=760,
+        width=1900,
+        margin={"t": 210},
+        legend={"title": "filler length and placement"},
+        **DARK,
+    )
+    write_dark_html(fig, "figs/filler_position.html")
+    print(f"{green}wrote figs/filler_position.html{endc}")
+    print(f"no filler {p0:.2f}")
+    for (key, k), pk in p.items():
+        print(f"  {key[0]:16s} {'before' if key[1] else 'after ':6s} k={k:3d}: {pk.mean().item():.2f}")
+
+#%% Selector check: greedy answers for the same question under 9 differently seeded prompts (no filler after the question; nothing, or 10 / 100 tokens of dots, Wikipedia text, counting or random integers before it). Could a selector over these runs beat one run? Majority vote, most confident (highest P of its own greedy answer) and the oracle (any run right) against the single clean run; saves results/selector_{TAG}.json
+
+run_selector = True
+if run_selector:
+    n_items, batch_size = 600, 16
+    # n_items = 32
+    conds = [("none", 0)] + [(kind, n) for kind in ["dots", "wiki", "count", "rand"] for n in [10, 100]]
+    out = {}
+    for kind, n in conds:
+        pts = [prompt_ids(tok, shots, it, 0, "dots", (kind, n) if n else None) for it in items[:n_items]]
+        cache = prefill(model, pts[0][0])
+        ans, conf = [], []
+        for i in pbar(range(0, n_items, batch_size), desc=f"{kind} {n}"):
+            gens, first = decode(model, cache, [tail for _, tail in pts[i:i + batch_size]])
+            ans += [parse_answer(tok.decode([x for x in g if x != EOS])) for g in gens]
+            conf += [first[j, g[0]].exp().item() for j, g in enumerate(gens)]  # P of the first answer token, the greedy run's own confidence
+        out[f"{kind}_{n}"] = {"answer": ans, "conf": conf}
+        print(f"{cyan}{kind} {n}: greedy accuracy {sum(a == it['answer'] for a, it in zip(ans, items)) / n_items:.3f}{endc}")
+    json.dump(out, open(f"results/selector_{TAG}.json", "w"))
+    right = t.tensor([[out[c]["answer"][i] == items[i]["answer"] for c in out] for i in range(n_items)])  # [items, conds]
+    answers = [[out[c]["answer"][i] for c in out] for i in range(n_items)]
+    confs = t.tensor([[out[c]["conf"][i] for c in out] for i in range(n_items)])
+    vote = [Counter(a).most_common(1)[0][0] == items[i]["answer"] for i, a in enumerate(answers)]
+    most_conf = [answers[i][confs[i].argmax()] == items[i]["answer"] for i in range(n_items)]
+    print(f"{green}single clean run {right[:, 0].float().mean():.3f}; mean over the 9 runs {right.float().mean():.3f}; majority vote {sum(vote) / n_items:.3f}; most confident {sum(most_conf) / n_items:.3f}; oracle (any run right) {right.any(1).float().mean():.3f}; all 9 agree {sum(len(set(a)) == 1 for a in answers) / n_items:.3f}{endc}")
 
 #%% The full prompt as the model sees it, one box per token (hover for position, id and repr), the token where the answer is read outlined; written to figs/prompt_k{k}.html
 

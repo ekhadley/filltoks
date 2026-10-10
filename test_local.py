@@ -63,6 +63,9 @@ for k in [0, 100, 300]:
     diff = (batched - full).abs().max().item()
     print(f"{cyan}k={k} (tails {[len(tl) for tl in tails]}): cached right-padded batch vs full forward max |dlogit| {diff:.2e}, reuse {(batched - again).abs().max().item():.1e}{endc}")
     assert diff < 1e-4 and t.equal(batched, again)
+    chunked = tail_logits(model, prefill(model, prefix, chunk=64), tails, n_last=n_last)
+    print(f"{cyan}k={k}: prefix prefilled in 64-token chunks vs at once max |dlogit| {(chunked - batched).abs().max().item():.2e}{endc}")
+    assert (chunked - batched).abs().max().item() < 1e-4
     gens, first = decode(model, cache, tails)
     for tl, g in zip(tails, gens):
         ids = t.tensor([prefix + tl], device=model.cfg.device)

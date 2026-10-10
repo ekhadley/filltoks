@@ -1271,7 +1271,7 @@ wheels = [
 [[package]]
 name = "mechtools"
 version = "0.1.0"
-source = { git = "ssh://git@github.com/ekhadley/mechtools#dbc450e5a95ab01bf3f2c50edcba7204b042b768" }
+source = { git = "ssh://git@github.com/ekhadley/mechtools#dafedd0cdd9c1dff21ef5106b38ddac28f8891f3" }
 dependencies = [
     { name = "httpx" },
     { name = "huggingface-hub" },
@@ -1280,6 +1280,7 @@ dependencies = [
     { name = "peft" },
     { name = "plotly" },
     { name = "python-dotenv" },
+    { name = "pyyaml" },
     { name = "safetensors" },
     { name = "scipy" },
     { name = "tabulate" },

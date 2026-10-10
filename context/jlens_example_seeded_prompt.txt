@@ -1,0 +1,104 @@
+<｜begin▁of▁sentence｜>You will be given a list of variable definitions followed by a question. Each variable equals either a number or an expression that refers to an earlier variable (for example 'twice the number for X plus 3'). Resolve the references to work out the value the question asks for, then answer immediately with just the number, nothing else. No explanation, no words, no reasoning, just the number. Some filler text may follow the question on the 'Filler:' line before the answer.
+
+Traditional Chinese literary criticism emphasized the life of the author when interpreting a work , a practice which Burton Watson attributes to " the close links that traditional Chinese thought posits between art and morality " . Since many of Du Fu 's poems feature morality and history , this practice is particularly important . Another reason , identified by the Chinese historian William Hung , is that Chinese poems are typically concise , omitting context that might be relevant , but which an informed contemporary could be assumed to know . For modern Western readers , " The less accurately we know the time , the place and the circumstances in the background , the more liable we are to imagine it incorrectly ,
+
+<｜User｜>kic = 39
+qil = 45
+qiv = 34
+qup = twice the number for qiv plus 7
+hiq = 43
+Question: What is three times the number for qup plus 2?
+
+Filler:
+
+Answer:<｜Assistant｜></think>227<｜end▁of▁sentence｜><｜User｜>yux = 50
+feg = 55
+zis = three times the number for feg plus 14
+xos = three times the number for yux minus 48
+xir = twice the number for zis plus 43
+Question: What is three times the number for zis minus 30?
+
+Filler:
+
+Answer:<｜Assistant｜></think>507<｜end▁of▁sentence｜><｜User｜>buk = 91
+zuv = 75
+jit = 64
+mip = three times the number for zuv minus 48
+jaz = three times the number for zuv plus 7
+Question: What is three times the number for mip plus 15?
+
+Filler:
+
+Answer:<｜Assistant｜></think>546<｜end▁of▁sentence｜><｜User｜>qus = 94
+luf = 53
+fom = 98
+yuv = twice the number for luf plus 8
+viy = 48
+Question: What is three times the number for yuv minus 22?
+
+Filler:
+
+Answer:<｜Assistant｜></think>320<｜end▁of▁sentence｜><｜User｜>bez = 91
+naq = three times the number for bez minus 26
+ced = 20
+cuv = three times the number for naq minus 32
+peh = twice the number for bez plus 17
+Question: What is twice the number for peh minus 33?
+
+Filler:
+
+Answer:<｜Assistant｜></think>365<｜end▁of▁sentence｜><｜User｜>kav = 70
+gub = twice the number for kav plus 1
+maz = three times the number for kav minus 38
+riv = three times the number for maz plus 9
+dih = twice the number for maz plus 40
+Question: What is three times the number for maz minus 10?
+
+Filler:
+
+Answer:<｜Assistant｜></think>506<｜end▁of▁sentence｜><｜User｜>zix = 30
+hof = 77
+nuv = three times the number for hof plus 50
+kuq = three times the number for nuv plus 2
+mup = twice the number for kuq minus 21
+Question: What is twice the number for nuv minus 30?
+
+Filler:
+
+Answer:<｜Assistant｜></think>532<｜end▁of▁sentence｜><｜User｜>vah = 40
+xok = three times the number for vah minus 2
+mez = twice the number for xok plus 17
+hil = twice the number for vah minus 27
+bik = twice the number for hil minus 4
+Question: What is twice the number for hil minus 43?
+
+Filler:
+
+Answer:<｜Assistant｜></think>63<｜end▁of▁sentence｜><｜User｜>foq = 72
+xuy = three times the number for foq minus 29
+hux = three times the number for xuy plus 46
+zil = twice the number for hux plus 10
+qet = three times the number for foq minus 10
+Question: What is twice the number for xuy minus 30?
+
+Filler:
+
+Answer:<｜Assistant｜></think>344<｜end▁of▁sentence｜><｜User｜>kox = 15
+xed = twice the number for kox plus 9
+wuq = three times the number for kox minus 24
+lik = three times the number for wuq plus 28
+jux = three times the number for lik minus 19
+Question: What is twice the number for xed minus 50?
+
+Filler:
+
+Answer:<｜Assistant｜></think>28<｜end▁of▁sentence｜><｜User｜>yal = 89
+qit = 21
+zam = twice the number for qit plus 24
+toq = twice the number for qit minus 16
+zuw = three times the number for toq plus 22
+Question: What is three times the number for toq minus 2?
+
+Filler:
+
+Answer:<｜Assistant｜></think>
