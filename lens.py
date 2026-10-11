@@ -29,7 +29,7 @@ def space_rows(fig, gap_px: float) -> list[tuple[float, float]]:
     gap = gap_px / (fig.layout.height - fig.layout.margin.t - fig.layout.margin.b)
     old = sorted({tuple(ax["domain"]) for name, ax in fig.layout.to_plotly_json().items() if name.startswith("yaxis")}, key=lambda d: -d[0])
     h = (1 - gap * (len(old) - 1)) / len(old)
-    new = [(1 - (j + 1) * h - j * gap, 1 - j * h - j * gap) for j in range(len(old))]
+    new = [(max(1 - (j + 1) * h - j * gap, 0.0), 1 - j * h - j * gap) for j in range(len(old))]  # the bottom row's 0 can come out as -1e-17
     for name, ax in fig.layout.to_plotly_json().items():
         if name.startswith("yaxis"):
             fig.layout[name].domain = new[old.index(tuple(ax["domain"]))]
@@ -65,9 +65,9 @@ def score_dropdown(fig, heats: dict, titles: dict):
     """A dropdown at the top right that swaps every facet's data for another scoring (the keys of `heats`, in order) and changes the title and colorbar label with it."""
     first = next(iter(heats.values()))
     assert len(fig.data) == len(first) and all(t.allclose(t.tensor(tr.z, dtype=t.float32), first[i]) for i, tr in enumerate(fig.data))  # a button restyles trace i with facet i
-    fig.update_layout(title={"y": 0.99, "yanchor": "top"}, updatemenus=[{  # the title starts at the top of the margin so the dropdown fits below it
+    fig.update_layout(title={"y": 1 - 45 / fig.layout.height, "yanchor": "top"}, updatemenus=[{  # the title 45 px from the top, the dropdown 30 px above the panels (clear of the facet labels)
         "buttons": [{"label": score_text[s][0], "method": "update", "args": [{"z": heats[s].round(decimals=3).tolist()}, {"title.text": titles[s], "coloraxis.colorbar.title.text": score_text[s][1]}]} for s in heats],
-        "x": 1, "xanchor": "right", "y": 1.025, "yanchor": "bottom", "bgcolor": "#333333", "bordercolor": "#888888", "font": {"color": "#dddddd"},
+        "x": 1, "xanchor": "right", "y": 1, "yanchor": "bottom", "pad": {"b": 30}, "bgcolor": "#333333", "bordercolor": "#888888", "font": {"color": "#dddddd"},
     }])
 
 hc_head, norm, W = hf.model.hc_head.original_component, hf.model.norm.original_component, hf.lm_head.weight
@@ -122,14 +122,19 @@ def run_lens(cache, tails: list[list[int]], chains: list[dict], n_keep: int, tar
 
 run_lens_all = True
 if run_lens_all:
+    kind = "dots"
+    # kind = "alpha"  # the capital alphabet 'A B ... Z' (utils.TEXT_FILLER): once at k = 27 (26 letters + the line's closing newline), repeated to 100 positions
     ks = [0, 25, 100]
+    # ks = [27, 100]
+    out = f"results/lens_{TAG}.pt"
+    # out = f"results/lens_{kind}_{TAG}.pt"
     n_items = 600
     # n_items = 32
     batch_size = 16
     use = [it for it in items[:n_items] if all(0 <= v < 1000 for v in it["chain"].values())]
     res = {}
     for k in ks:
-        pts = [prompt_ids(tok, shots, it, k) for it in use]
+        pts = [prompt_ids(tok, shots, it, k, kind) for it in use]
         assert all(prefix == pts[0][0] for prefix, _ in pts)
         n_keep = k + 7 + N_Q
         assert regions(tok, pts[0][1], k)["label"][0] == len(pts[0][1]) - n_keep + N_Q and len(position_names(k)) == n_keep
@@ -139,8 +144,8 @@ if run_lens_all:
         res[k]["num_p_mean"] = res[k].pop("num_p_sum").sum(0) / len(use)
         res[k]["idx"] = t.tensor([it["idx"] for it in use])
         print(f"{cyan}k={k}: {len(use)} items, greedy correct {res[k]['correct'].float().mean():.3f}, mean P(answer) {res[k]['model_logp'].exp().mean():.3f}, max last-layer lens gap {res[k]['gap'].max():.4f} nats{endc}")
-    t.save(res, f"results/lens_{TAG}.pt")
-    print(f"{green}saved results/lens_{TAG}.pt{endc}")
+    t.save(res, out)
+    print(f"{green}saved {out}{endc}")
 
 #%% Coefficient variants: base items whose every (c1, c2) combination within each coefficient set keeps all chain values in 0..999, each rewritten with both hop coefficients set (x, k1, k2 and the other definitions unchanged; the shots keep their 2s and 3s); saves results/lens_coef_{TAG}.pt
 
@@ -209,12 +214,17 @@ plot_lens_heatmaps = True
 if plot_lens_heatmaps:
     min_layer = 20
     n_show_q = 8
+    kind = "dots"
+    # kind = "alpha"  # the alphabet filler (results/lens_alpha_{TAG}.pt); the 0-dot run is the reference in every row
     ks = [0, 10, 100]
     # ks = [0, 5, 10, 15, 25, 100]
+    # ks = [27, 100]  # alpha
     coefswap = False
-    res = {**t.load(f"results/lens_{TAG}.pt"), **t.load(f"results/lens_{TAG}_small.pt"), **t.load(f"results/lens_{TAG}_numdist.pt")}
-    coef_sets = t.load(f"results/lens_coef_{TAG}.pt")["coef_sets"]
-    coef_res = {**t.load(f"results/lens_coef_{TAG}.pt")["res"], **t.load(f"results/lens_coef_{TAG}_k100.pt")["res"]}
+    res = {**t.load(f"results/lens_{TAG}.pt"), **t.load(f"results/lens_{TAG}_small.pt"), **t.load(f"results/lens_{TAG}_numdist.pt")} if kind == "dots" else {0: t.load(f"results/lens_{TAG}.pt")[0], **t.load(f"results/lens_{kind}_{TAG}.pt")}
+    if coefswap:
+        coef_sets = t.load(f"results/lens_coef_{TAG}.pt")["coef_sets"]
+        coef_res = {**t.load(f"results/lens_coef_{TAG}.pt")["res"], **t.load(f"results/lens_coef_{TAG}_k100.pt")["res"]}
+    cond = lambda k, br=" ": f"{k} dots" if kind == "dots" or k == 0 else f"the alphabet{br}at {k} positions"
     assert all(t.equal(r["idx"], res[0]["idx"]) for r in res.values())
     ex = items[0]
     ch = ex["chain"]
@@ -222,9 +232,9 @@ if plot_lens_heatmaps:
     cols = [("x", "x: the given number"), ("y", "y: the hidden first result"), ("c2y", "c2·y: the second product"), ("answer", "the final answer")]
     c0, c100 = res[0]["correct"], res[100]["correct"]
     groups = {
-        f"<b>Always right</b><br>right with 0 dots<br>and with 100<br>n={(c0 & c100).sum().item()}": c0 & c100,
-        f"<b>Flipped by filler</b><br>wrong with 0 dots,<br>right with 100<br>n={(~c0 & c100).sum().item()}": ~c0 & c100,
-        f"<b>Always wrong</b><br>wrong with 0 dots<br>and with 100<br>n={(~c0 & ~c100).sum().item()}": ~c0 & ~c100,
+        f"<b>Always right</b><br>right with 0 dots<br>and with {cond(100, '<br>')}<br>n={(c0 & c100).sum().item()}": c0 & c100,
+        f"<b>Flipped by filler</b><br>wrong with 0 dots,<br>right with {cond(100, '<br>')}<br>n={(~c0 & c100).sum().item()}": ~c0 & c100,
+        f"<b>Always wrong</b><br>wrong with 0 dots<br>and with {cond(100, '<br>')}<br>n={(~c0 & ~c100).sum().item()}": ~c0 & ~c100,
     }
     tgt = t.tensor([[items[i]["chain"][name] for name in TARGETS] for i in res[0]["idx"].tolist()])
     cc = tgt[:, [1, 3]] // tgt[:, [0, 2]]
@@ -233,10 +243,10 @@ if plot_lens_heatmaps:
         r = res[k]
         coef_rows = {f"<b>{name}</b><br>n={m.sum().item()}<br>accuracy {r['correct'][m].float().mean():.0%}" + (f"<br>(0 dots: {c0[m].float().mean():.0%})" if k else ""): m for name, m in [("×2 then ×2", (cc == 2).all(1)), ("One ×2, one ×3<br>(either order)", cc[:, 0] != cc[:, 1]), ("×3 then ×3", (cc == 3).all(1))]}
         about = (
-            f"Top three rows: the same questions at every filler length, grouped by whether the model's answer is right with 0 and with 100 dots ({(c0 & ~c100).sum().item()} questions right with 0 but wrong with 100 are not shown)."
+            f"Top three rows: the same questions at every filler length, grouped by whether the model's answer is right with 0 dots and with {cond(100)} ({(c0 & ~c100).sum().item()} questions right with 0 dots but wrong with {cond(100)} are not shown)."
             "<br>Bottom three rows: the same questions grouped by their two multipliers, c1 in y = c1·x ± a and c2 in answer = c2·y ± b ('twice' = ×2, 'three times' = ×3). The example is ×3 then ×2."
         )
-        jobs.append((f"figs/lens_k{k}", k, r, tgt, {**groups, **coef_rows}, about, example))
+        jobs.append((f"figs/lens_k{k}" if kind == "dots" else f"figs/lens_{kind}_k{k}", k, r, tgt, {**groups, **coef_rows}, about, example))
     for si, (lo, hi) in enumerate(coef_sets) if coefswap else []:
         for k in sorted(coef_res):
             r = coef_res[k]
@@ -252,20 +262,23 @@ if plot_lens_heatmaps:
         n_layers = r["rank"].shape[1]
         scores = [s for s in score_text if s != "resid" or "num_p_mean" in r]
         heats, titles = {}, {}
+        filler_desc = f"{k} filler dots ('Filler: . . .')" if kind == "dots" or k == 0 else f"the alphabet as filler, {k} positions ('Filler: A B C … Z" + (" A B …')" if k > 27 else "' and its newline)")
         for score in scores:
             v = scored(r, jt, score)
             heats[score] = t.stack([v[m][:, min_layer:, N_Q - n_show_q:, TARGETS.index(name)].mean(0) for m in rows.values() for name, _ in cols])
             low = max(v[m][:, :min_layer, N_Q - n_show_q:, TARGETS.index(name)].mean(0).max().item() for m in rows.values() for name, _ in cols)
             titles[score] = (
-                f"<b>Which number is the model working with at each layer and token?</b>  DeepSeek V4 Flash, {k} filler dots ('Filler: . . .') between question and answer"
+                f"<b>Which number is the model working with at each layer and token?</b>  DeepSeek V4 Flash, {filler_desc} between question and answer"
                 f"<br><span style='font-size:13px'>{ex_text}</span>"
                 f"<br><span style='font-size:13px'>{score_text[score][2]}</span>"
                 f"<br><span style='font-size:13px'>{about}</span><br><span style='font-size:13px'>Layers 0–{min_layer - 1} are not shown (at most {low:.2f} on this scale there). The model has 43 layers (0–42); its answer is read at the last token. The dropdown at the top right changes the scoring.</span>"
             )
         heat = heats[scores[0]]
-        dot_step = 1 if k <= 15 else 5 if k <= 25 else 10
+        tail = prompt_ids(tok, shots, items[0], k, kind)[1]
+        fill = [tok.decode([x]).strip() or "↵" for x in tail[len(tail) - 4 - k:len(tail) - 4]]  # the filler tokens: dots, or letters and the closing newline
+        step = (1 if k <= 15 else 5 if k <= 25 else 10) if kind == "dots" else (1 if k <= 27 else 5)
         ticks = [(j, f"'{s}'") for j, s in enumerate(["number", "for", "y", "aj", "plus", " ", "36", "?"])] + [(n_show_q, "'F'"), (n_show_q + 1, "'iller'"), (n_show_q + 2, "':'")]
-        ticks += [(n_show_q + 2 + d, f"dot {d}") for d in range(1, k + 1) if d == 1 or d % dot_step == 0]
+        ticks += [(n_show_q + 2 + d, f"dot {d}" if kind == "dots" else f"{d} '{fill[d - 1]}'") for d in range(1, k + 1) if d == 1 or d % step == 0 or d == k and kind != "dots"]
         ticks += [(n_show_q + 3 + k, "'Answer'"), (n_show_q + 4 + k, "':'"), (n_show_q + 5 + k, "‹assistant›"), (n_show_q + 6 + k, "‹answer here›")]
         assert ticks[-1][0] == heat.shape[-1] - 1
         fig = imshow(
@@ -282,7 +295,7 @@ if plot_lens_heatmaps:
             title=titles[scores[0]],
             height=300 * len(rows) + 400,
             width=1900,
-            margin={"t": 305, "l": 210, "r": 40, "b": 110},
+            margin={"t": 240, "l": 210, "r": 40, "b": 110},
             return_fig=True,
         )
         score_dropdown(fig, heats, titles)
@@ -294,7 +307,7 @@ if plot_lens_heatmaps:
         row_y = space_rows(fig, 100)
         for (y0, y1), label in zip(row_y, rows):
             fig.add_annotation(text=label, xref="paper", yref="paper", x=-0.035, y=(y0 + y1) / 2, xanchor="right", showarrow=False, align="right", font={"size": 13})
-        fig.add_annotation(text="Tick labels on the question tokens are from the example question; white lines mark the end of the question, the 'Filler:' label, and the end of the dots.", xref="paper", yref="paper", x=0, y=-0.085, xanchor="left", showarrow=False, font={"size": 11})
+        fig.add_annotation(text="Tick labels on the question tokens are from the example question; white lines mark the end of the question, the 'Filler:' label, and the end of the filler.", xref="paper", yref="paper", x=0, y=-0.085, xanchor="left", showarrow=False, font={"size": 11})
         write_dark_html(fig.update_layout(**DARK), path + ".html")
     print(f"{green}wrote {len(jobs)} heatmaps to figs/{endc}")
 
@@ -507,7 +520,7 @@ if plot_lens_2fact:
             title=titles["top1"],
             height=300 * len(rows) + 400,
             width=1500,
-            margin={"t": 305, "l": 210, "r": 40, "b": 110},
+            margin={"t": 220, "l": 210, "r": 40, "b": 110},
             return_fig=True,
         )
         score_dropdown(fig, heats, titles)

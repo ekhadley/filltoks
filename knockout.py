@@ -277,6 +277,58 @@ if run_seeded:
                 json.dump(records, open(f"results/seeded_{TAG}.json", "w"))
     print(f"{green}saved results/seeded_{TAG}.json{endc}")
 
+#%% Figure for readers without context: mean P(correct) when each dot has its own block of random integers (results/seeded_{TAG}.json), by placement and what sees the blocks, dots seeing each other vs alone, all questions with the flipped and unchanged groups (from the dose sweep) in the hover; written to figs/seeded.html
+
+plot_seeded = True
+if plot_seeded:
+    n_boot = 2000
+    dose_file = f"results/dose_{TAG}.json"
+    recs = json.load(open(f"results/seeded_{TAG}.json"))
+    dose = {(r["idx"], r["k"]): math.exp(r["logp"]) for r in json.load(open(dose_file))}
+    idxs = sorted({r["idx"] for r in recs})
+    groups = {"all": idxs, "flipped by 100 dots": [i for i in idxs if dose[(i, 0)] < 0.3 and dose[(i, 100)] >= 0.6], "unchanged by 100 dots": [i for i in idxs if abs(dose[(i, 100)] - dose[(i, 0)]) <= 0.1]}
+    p = {(r["idx"], r["placement"], r["see"], r["alone"]): math.exp(r["logp"]) for r in recs}
+    conds = [  # (placement, see, label)
+        ("plain", "hidden", "plain dots,<br>no integers"),
+        ("before", "hidden", "integers above the definitions,<br>hidden from everything"),
+        ("before", "own", "integers above the definitions,<br>each dot sees its own block"),
+        ("before", "seen", "integers above the definitions,<br>seen by everything"),
+        ("inline", "hidden", "integers before each dot,<br>hidden from everything"),
+        ("inline", "own", "integers before each dot,<br>each dot sees its own block"),
+        ("inline", "seen", "integers before each dot,<br>seen by everything"),
+    ]
+    def stat(idx: list[int], pl: str, see: str, alone: bool) -> tuple[float, float, float]:
+        v = t.tensor([p[(i, pl, see, alone)] for i in idx])
+        boot = v[t.randint(0, len(v), (n_boot, len(v)), generator=t.Generator().manual_seed(0))].mean(1)
+        return v.mean().item(), boot.quantile(0.025).item(), boot.quantile(0.975).item()
+    fig = go.Figure()
+    for alone, name, color in [(False, "dots see each other", SERIES[0]), (True, "each dot sees no other dot", SERIES[1])]:
+        m, lo, hi = zip(*[stat(idxs, pl, see, alone) for pl, see, _ in conds])
+        hover = [f"{lab.replace('<br>', ' ')}, {name}<br>all questions {v:.3f}<br>" + "<br>".join(f"{g} (n={len(ix)}) {stat(ix, pl, see, alone)[0]:.3f}" for g, ix in list(groups.items())[1:]) for (pl, see, lab), v in zip(conds, m)]
+        fig.add_trace(go.Bar(name=name, x=[c[2] for c in conds], y=[round(v, 4) for v in m], marker_color=color, hovertext=hover, hovertemplate="%{hovertext}<extra></extra>",
+            error_y={"type": "data", "symmetric": False, "array": [h - v for v, h in zip(m, hi)], "arrayminus": [v - l for v, l in zip(m, lo)]},
+            text=[f"{v:.2f}" for v in m], textposition="outside", textfont={"size": 12}))
+    p0, p50 = (sum(dose[(i, kk)] for i in idxs) / len(idxs) for kk in [0, 50])
+    fig.add_hline(y=p0, line={"dash": "dot", "color": "#888"}, annotation_text=f"no filler {p0:.2f}", annotation_position="top left")
+    a = {(pl, see, al): stat(idxs, pl, see, al)[0] for pl, see, _ in conds for al in [False, True]}
+    fig.update_layout(
+        title={"y": 0.95, "yanchor": "top", "text": (
+            f"<b>Giving each filler dot its own random numbers does not change what the filler does: {a[('before', 'own', False)]:.2f} with the dots seeing each other and {a[('before', 'own', True)]:.2f} alone, against {a[('before', 'hidden', False)]:.2f} and {a[('before', 'hidden', True)]:.2f} with the numbers hidden</b>"
+            f"<br><span style='font-size:13px'>DeepSeek V4 Flash, {len(idxs)} two-step arithmetic questions, 50 filler dots between the question and 'Answer:'. The idea under test: filler helps because each dot re-runs the same computation from a slightly different starting point, and the answer picks among the results.</span>"
+            "<br><span style='font-size:13px'>So each of the 50 dots gets its own block of 4 random three-digit integers, placed above the definitions (a dot reaches its block only through one pooled long-range entry) or right before the dot (inside its exact attention window, but the filler is then 450 tokens long).</span>"
+            "<br><span style='font-size:13px'>Attention is edited at every layer: 'hidden' means no position can attend to any block; 'each dot sees its own block' means dot i attends to block i and nothing else attends to any block (blocks see only themselves and the rest of the prompt); 'seen' leaves attention unedited.</span>"
+            "<br><span style='font-size:13px'>With the integers before each dot and hidden, the question itself is out of reach (the edit removes the pooled entries that would carry it), so those bars are not interpretable.</span>"
+            "<br><span style='font-size:13px'>Probability of the correct answer: the model's probability of writing exactly the right number and stopping. Error bars: 95% intervals from resampling questions.</span>"
+        )},
+        barmode="group", height=880, width=1900, margin={"t": 200, "b": 110}, legend={"x": 0.78, "y": 0.98}, **DARK,
+    )
+    fig.update_yaxes(title_text="mean probability of the correct answer", range=[0, 1.0])
+    fig.update_xaxes(tickangle=0, tickfont={"size": 12})
+    write_dark_html(fig, "figs/seeded.html")
+    print(f"{green}wrote figs/seeded.html{endc}")
+    for g, ix in groups.items():
+        print(f"{g} (n={len(ix)}): " + "  ".join(f"{pl}/{see}={stat(ix, pl, see, False)[0]:.2f}|{stat(ix, pl, see, True)[0]:.2f}" for pl, see, _ in conds))
+
 #%% Figure for readers without context: mean P(correct) under each knockout, for all questions, the questions the filler flips, and the questions right either way (groups from the dose sweep); written to figs/knockout.html
 
 plot_knockout = True
@@ -322,7 +374,7 @@ if plot_knockout:
         fig.add_trace(go.Scatter(x=[b[2] for b in bars], y=[h + 0.05 for h in hi], text=[f"{v:.2f}" for v in m], mode="text", textfont={"size": 13}, showlegend=False, hoverinfo="skip"), row=row, col=1)
     a = {(kk, c): stat(idxs, kk, c)[0] for kk, c, _, _ in bars}
     fig.update_layout(
-        title={"y": 0.985, "yanchor": "top", "text": (
+        title={"y": 0.97, "yanchor": "top", "text": (
             f"<b>When each filler dot can attend only to the prompt and not to the other dots, the correct answer has probability {a[(100, 'alone')]:.2f}, against {a[(100, 'full')]:.2f} with the dots unmodified and {a[(0, 'full')]:.2f} with no filler</b>"
             f"<br>Dots in blocks of 4 / 8 / 25 that see only themselves: {a[(100, 'blocks_4')]:.2f} / {a[(100, 'blocks_8')]:.2f} / {a[(100, 'blocks_25')]:.2f}; just 4 / 8 / 25 dots: {a[(4, 'full')]:.2f} / {a[(8, 'full')]:.2f} / {a[(25, 'full')]:.2f}; 'Answer:' blind to the dots: {a[(100, 'answer_blind')]:.2f}.  (DeepSeek V4 Flash, {len(idxs)} questions, 100 dots)"
             "<br><span style='font-size:13px'>Task: two-step arithmetic in words. A number x is given, y = c₁·x ± k₁ is defined, and the question asks for c₂·y ± k₂. 100 filler dots sit between the question and 'Answer:'; the prompt's 10 worked examples carry the same filler.</span>"
@@ -332,7 +384,7 @@ if plot_knockout:
         )},
         height=1500,
         width=1900,
-        margin={"t": 245, "b": 120},
+        margin={"t": 205, "b": 120},
         **DARK,
     )
     fig.update_yaxes(title_text="mean probability of the correct answer", range=[0, 1.08])

@@ -137,7 +137,7 @@ def random_ints_text(seed: int) -> str:
     rng = random.Random(seed)
     return " ".join(str(rng.randint(1, 1000)) for _ in range(2500))
 
-TEXT_FILLER = {"wiki": lambda seed: open("data/wiki_filler.txt").read(), "count": counting_text, "rand": random_ints_text}  # 'wiki': the English Wikipedia article 'Tree' on one line, 2500 tokens, the same for every seed
+TEXT_FILLER = {"wiki": lambda seed: open("data/wiki_filler.txt").read(), "count": counting_text, "rand": random_ints_text, "alpha": lambda seed: " ".join(chr(65 + i % 26) for i in range(2600))}  # 'wiki': the English Wikipedia article 'Tree' on one line, 2500 tokens, the same for every seed; 'alpha': the capital alphabet 'A B ... Z' repeated, one token per letter, the same for every seed
 
 @functools.lru_cache
 def text_filler(tok, text: str, k: int) -> str:
@@ -159,7 +159,7 @@ def prompt_ids(tok, shots: list[dict], item: dict, k: int, kind: str = "dots", b
     return prefix, tail
 
 def regions(tok, tail: list[int], k: int) -> dict[str, list[int]]:
-    """Tail positions of each prompt region. The last position ('</think>') reads out the answer."""
+    """Tail positions of each prompt region, for k dots or k positions of a text filler. The last position ('</think>') reads out the answer."""
     T = len(tail)
     q_start = [i for i, tid in enumerate(tail) if tok.decode([tid]).strip() == "Question"]
     assert len(q_start) == 1, q_start
@@ -172,7 +172,7 @@ def regions(tok, tail: list[int], k: int) -> dict[str, list[int]]:
         "last": [T - 1],
     }
     text = {name: tok.decode([tail[i] for i in pos]) for name, pos in reg.items()}
-    assert text["label"] == ("Filler:" if k else "Filler:\n\n") and text["filler"] == (" ." * k + "\n\n" if k else ""), text
+    assert text["label"] == ("Filler:" if k else "Filler:\n\n") and (text["filler"] == (" ." * k + "\n\n" if k else "") or k and text["filler"].endswith("\n\n")), text  # a text filler ends in the same newline
     assert text["post"] == "Answer:<｜Assistant｜>" and text["last"] == "</think>" and text["q_line"].startswith("Question:"), text
     return reg
 
