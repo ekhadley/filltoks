@@ -1,5 +1,7 @@
 #%% Setup: Brauer et al.'s logit-lens decode of the chain x -> c1x -> y -> c2y -> answer at every (layer, position) from the question end through the filler to the answer position
 
+import csv
+import math
 import json
 
 import torch as t
@@ -231,17 +233,28 @@ if plot_lens_heatmaps:
     example = f"Example question: <i>{ex['definitions'][0][0]} = {ch['x']} · {ex['queried_term']} = {dict(ex['definitions'])[ex['queried_term']]} · (3 more definitions) · {ex['question']}</i>  →  x = {ch['x']} (written), y = {ex['queried_term']} = {ch['y']} (never written), c2·y = {ch['c2y']}, answer = {ch['answer']}"
     cols = [("x", "x: the given number"), ("y", "y: the hidden first result"), ("c2y", "c2·y: the second product"), ("answer", "the final answer")]
     c0, c100 = res[0]["correct"], res[100]["correct"]
-    groups = {
-        f"<b>Always right</b><br>right with 0 dots<br>and with {cond(100, '<br>')}<br>n={(c0 & c100).sum().item()}": c0 & c100,
-        f"<b>Flipped by filler</b><br>wrong with 0 dots,<br>right with {cond(100, '<br>')}<br>n={(~c0 & c100).sum().item()}": ~c0 & c100,
-        f"<b>Always wrong</b><br>wrong with 0 dots<br>and with {cond(100, '<br>')}<br>n={(~c0 & ~c100).sum().item()}": ~c0 & ~c100,
-    }
+    rows_by = "correct"
+    # rows_by = "uplift"  # two rows: the above-noise risers from bench.py's find_uplift_subset (results/uplift_items_{TAG}.csv) vs every other question; written to figs/lens_uplift_k{k}.html
+    if rows_by == "uplift":
+        risers = {int(row["idx"]) for row in csv.DictReader(open(f"results/uplift_items_{TAG}.csv")) if row["above_noise"] == "1"}
+        up = t.tensor([i in risers for i in res[0]["idx"].tolist()])
+        groups = {f"<b>Uplift questions</b><br>P(correct) rises by more<br>than 0.56 from 0 to 100 dots<br>n={up.sum().item()}": up, f"<b>Everything else</b><br>n={(~up).sum().item()}": ~up}
+    else:
+        groups = {
+            f"<b>Always right</b><br>right with 0 dots<br>and with {cond(100, '<br>')}<br>n={(c0 & c100).sum().item()}": c0 & c100,
+            f"<b>Flipped by filler</b><br>wrong with 0 dots,<br>right with {cond(100, '<br>')}<br>n={(~c0 & c100).sum().item()}": ~c0 & c100,
+            f"<b>Always wrong</b><br>wrong with 0 dots<br>and with {cond(100, '<br>')}<br>n={(~c0 & ~c100).sum().item()}": ~c0 & ~c100,
+        }
     tgt = t.tensor([[items[i]["chain"][name] for name in TARGETS] for i in res[0]["idx"].tolist()])
     cc = tgt[:, [1, 3]] // tgt[:, [0, 2]]
     jobs = []
     for k in ks:
         r = res[k]
         coef_rows = {f"<b>{name}</b><br>n={m.sum().item()}<br>accuracy {r['correct'][m].float().mean():.0%}" + (f"<br>(0 dots: {c0[m].float().mean():.0%})" if k else ""): m for name, m in [("×2 then ×2", (cc == 2).all(1)), ("One ×2, one ×3<br>(either order)", cc[:, 0] != cc[:, 1]), ("×3 then ×3", (cc == 3).all(1))]}
+        if rows_by == "uplift":
+            about = f"Rows: the same questions at every filler length. Top: the {up.sum().item()} questions whose probability of the correct answer rises by more than 0.56 from 0 to 100 dots, which is more than 97.5% of the change between neighbouring filler lengths (90 or 95 vs 100 dots) on any question. Middle: the other {(~up).sum().item()} questions (right either way, wrong either way, or moved less). Accuracy at this length: {r['correct'][up].float().mean():.0%} and {r['correct'][~up].float().mean():.0%}. Bottom: the middle row minus the top row, on its own red-blue scale (blue: more of the value in the other questions, red: more in the uplift questions)."
+            jobs.append((f"figs/lens_uplift_k{k}", k, r, tgt, groups, about, example))
+            continue
         about = (
             f"Top three rows: the same questions at every filler length, grouped by whether the model's answer is right with 0 dots and with {cond(100)} ({(c0 & ~c100).sum().item()} questions right with 0 dots but wrong with {cond(100)} are not shown)."
             "<br>Bottom three rows: the same questions grouped by their two multipliers, c1 in y = c1·x ± a and c2 in answer = c2·y ± b ('twice' = ×2, 'three times' = ×3). The example is ×3 then ×2."
@@ -273,6 +286,10 @@ if plot_lens_heatmaps:
                 f"<br><span style='font-size:13px'>{score_text[score][2]}</span>"
                 f"<br><span style='font-size:13px'>{about}</span><br><span style='font-size:13px'>Layers 0–{min_layer - 1} are not shown (at most {low:.2f} on this scale there). The model has 43 layers (0–42); its answer is read at the last token. The dropdown at the top right changes the scoring.</span>"
             )
+        if rows_by == "uplift":  # third row: everything else minus the uplift questions, on a diverging scale of its own
+            for score in scores:
+                heats[score] = t.cat([heats[score], heats[score][len(cols):] - heats[score][:len(cols)]])
+            rows = {**rows, "<b>Difference</b><br>everything else<br>minus uplift questions": None}
         heat = heats[scores[0]]
         tail = prompt_ids(tok, shots, items[0], k, kind)[1]
         fill = [tok.decode([x]).strip() or "↵" for x in tail[len(tail) - 4 - k:len(tail) - 4]]  # the filler tokens: dots, or letters and the closing newline
@@ -298,6 +315,11 @@ if plot_lens_heatmaps:
             margin={"t": 240, "l": 210, "r": 40, "b": 110},
             return_fig=True,
         )
+        if rows_by == "uplift":
+            for tr in fig.data[2 * len(cols):]:
+                tr.coloraxis = "coloraxis2"
+            lim = math.ceil(max(h[2 * len(cols):].abs().max().item() for h in heats.values()) * 10) / 10  # the diverging scale spans the largest difference under any scoring, rounded up to 0.1
+            fig.update_layout(coloraxis={"colorbar": {"y": 0.72, "len": 0.5}}, coloraxis2={"colorscale": "RdBu", "cmin": -lim, "cmax": lim, "colorbar": {"title": {"text": f"difference<br>(else − uplift)<br>scale ±{lim:.1f}"}, "y": 0.14, "len": 0.28}})
         score_dropdown(fig, heats, titles)
         fig.update_annotations(font_size=15)
         fig.update_xaxes(tickvals=[j for j, _ in ticks], ticktext=[s for _, s in ticks], tickangle=-60, tickfont={"size": 10}, showticklabels=True)
@@ -401,6 +423,57 @@ if plot_rank_depth:
         write_dark_html(fig, path)
         print(f"{green}wrote {path}{endc}")
 
+#%% Decode by dot position, for readers without context: at 100 dots, the share of questions whose state at each dot ranks y, c2·y or the answer first (logit lens, any layer from 20), per dot and in blocks of 10 dots, for the heatmaps' three question groups. Do later dots carry better attempts? Written to figs/lens_dot_position.html
+
+plot_dot_position = True
+if plot_dot_position:
+    k = 100
+    names = {"y": "y: the hidden first result", "c2y": "c2·y: the second product", "answer": "the final answer"}
+    res = t.load(f"results/lens_{TAG}.pt")
+    groups_by = "correct"
+    # groups_by = "fer"  # two panels: the questions with P0 < 0.5 that 100 dots rid of over half their error (the right-hand mode of the bottom row of bench.py's figs/uplift_hist.html; P(correct) from results/dose_{TAG}.json) vs every other question; written to figs/lens_dot_position_fer.html
+    if groups_by == "fer":
+        dose = {(r["idx"], r["k"]): math.exp(r["logp"]) for r in json.load(open(f"results/dose_{TAG}.json"))}
+        p0, pk = (t.tensor([dose[(i, kk)] for i in res[k]["idx"].tolist()]) for kk in [0, k])
+        top = (p0 < 0.5) & ((pk - p0) / (1 - p0) > 0.5)
+        groups = {"over half the error removed": top, "every other question": ~top}
+        about = f"Groups: questions whose probability of the correct answer is below 0.5 with no filler and that 100 dots rid of over half their remaining error ((with − without) / (1 − without) > 0.5), and every other question."
+    else:
+        c0, c100 = res[0]["correct"], res[k]["correct"]
+        groups = {"always right": c0 & c100, "flipped by filler": ~c0 & c100, "always wrong": ~c0 & ~c100}
+        about = "Groups: whether the final answer is right with 0 and with 100 dots."
+    n_pos = res[k]["rank"].shape[2]
+    dots = list(range(n_pos - 4 - k, n_pos - 4))  # the last dot is merged with the line's closing newline: left out of the blocks
+    hit = (res[k]["rank"][:, 20:, dots] == 0).any(1).float()  # [question, dot, value]: ranked first at some layer >= 20
+    fig = make_subplots(rows=1, cols=len(groups), shared_yaxes=True, subplot_titles=[f"{g} (n={m.sum().item()})" for g, m in groups.items()], horizontal_spacing=0.04)
+    for col, (g, m) in enumerate(groups.items(), 1):
+        for (name, label), color in zip(names.items(), SERIES):
+            share = hit[m][:, :, TARGETS.index(name)].mean(0)
+            blocks = share[:k - 1].split(10)
+            fig.add_trace(go.Scatter(x=list(range(1, k + 1)), y=share.tolist(), mode="lines", line={"color": color, "width": 1}, opacity=0.35, legendgroup=name, showlegend=False, hoverinfo="x+y"), row=1, col=col)
+            fig.add_trace(go.Scatter(x=[10 * i + (len(b) + 1) / 2 for i, b in enumerate(blocks)], y=[b.mean().item() for b in blocks], mode="lines+markers", line={"color": color, "width": 3}, name=label, legendgroup=name, showlegend=col == 1), row=1, col=col)
+            print(f"{cyan}{g}, {name}: blocks of 10 dots " + " ".join(f"{b.mean():.2f}" for b in blocks) + f"; dots 1-49 {share[:49].mean():.2f}, 50-99 {share[49:k - 1].mean():.2f}; last dot (with the newline) {share[-1]:.2f}{endc}")
+    fig.update_xaxes(title_text="filler dot (1 = first after 'Filler:', 100 = last before 'Answer:')", range=[0, 101])
+    fig.update_yaxes(title_text="share of questions with the value ranked first", range=[0, 1], col=1)
+    fig.update_layout(
+        title=(
+            "<b>Are later filler dots better attempts?</b>  DeepSeek V4 Flash, 600 two-step arithmetic questions with 100 filler dots ('Filler: . . .') between the question and 'Answer:'"
+            "<br><span style='font-size:13px'>Each question gives a number x and asks for c2·y ± b, where y = c1·x ± a is never written. At each dot, the model's state at every layer is read through its own output layer (the 'logit lens'),</span>"
+            "<br><span style='font-size:13px'>and the value counts as decoded at that dot if it is ranked first among the numbers 0–999 at any layer from 20 on. If later dots refined earlier attempts, the lines would rise from left to right.</span>"
+            "<br><span style='font-size:13px'>Thin lines: each dot. Thick lines: averages over blocks of 10 dots (the last block 9; the 100th dot is merged with the line break before 'Answer:' and is left out of the blocks).</span>"
+            f"<br><span style='font-size:13px'>{about}</span>"
+            "<br><span style='font-size:13px'>The lens only sees a value when it comes out on top, so a value can be present at a dot and still be missed.</span>"
+        ),
+        height=800,
+        width=1500,
+        margin={"t": 290},
+        legend={"title": "chain value", "orientation": "h", "y": -0.15},
+        **DARK,
+    )
+    path = f"figs/lens_dot_position{'_fer' if groups_by == 'fer' else ''}.html"
+    write_dark_html(fig, path)
+    print(f"{green}wrote {path}{endc}")
+
 #%% Filler uplift by multiplier, for readers without context: mean probability of the correct answer (or greedy accuracy) at 0, 10 and 100 filler dots and the change from 0 dots, on the coefficient-swapped questions (the same base questions in every kind), with 95% bootstrap intervals over questions
 
 plot_uplift_coef = True
@@ -474,11 +547,20 @@ if plot_lens_2fact:
     assert all(t.equal(r["idx"], res[0]["idx"]) for r in res.values())
     ex = items2[res[0]["idx"][0].item()]
     c0, c10 = res[0]["correct"], res[10]["correct"]
-    rows = {
-        f"<b>Always right</b><br>right with 0 dots<br>and with 10<br>n={(c0 & c10).sum().item()}": c0 & c10,
-        f"<b>Flipped by filler</b><br>wrong with 0 dots,<br>right with 10<br>n={(~c0 & c10).sum().item()}": ~c0 & c10,
-        f"<b>Always wrong</b><br>wrong with 0 dots<br>and with 10<br>n={(~c0 & ~c10).sum().item()}": ~c0 & ~c10,
-    }
+    rows_by = "correct"
+    # rows_by = "uplift"  # two rows: questions whose P(correct) rises by more than 0.56 from 0 to 10 dots (the equations' noise threshold from bench.py's find_uplift_subset; results/facts2_bench_{TAG}.json) vs the rest; written to figs/lens2_uplift_k{k}.html
+    if rows_by == "uplift":
+        lp2 = {(r["idx"], r["k"]): r["logp"] for r in json.load(open(f"results/facts2_bench_{TAG}.json"))}
+        up = t.tensor([math.exp(lp2[(i, 10)]) - math.exp(lp2[(i, 0)]) > 0.56 for i in res[0]["idx"].tolist()])
+        rows = {f"<b>Uplift questions</b><br>P(correct) rises by more<br>than 0.56 from 0 to 10 dots<br>n={up.sum().item()}": up, f"<b>Everything else</b><br>n={(~up).sum().item()}": ~up}
+        row_text = lambda k: f"Rows: the same questions at both filler lengths. Top: the {up.sum().item()} questions whose probability of the correct answer rises by more than 0.56 from 0 to 10 dots (the threshold is the 97.5% quantile of the change between neighbouring filler lengths on the equations task; this task has no neighbouring-length run). Bottom: the other {(~up).sum().item()} questions. Accuracy at this length: {res[k]['correct'][up].float().mean():.0%} and {res[k]['correct'][~up].float().mean():.0%}. 5 worked examples precede the question."
+    else:
+        rows = {
+            f"<b>Always right</b><br>right with 0 dots<br>and with 10<br>n={(c0 & c10).sum().item()}": c0 & c10,
+            f"<b>Flipped by filler</b><br>wrong with 0 dots,<br>right with 10<br>n={(~c0 & c10).sum().item()}": ~c0 & c10,
+            f"<b>Always wrong</b><br>wrong with 0 dots<br>and with 10<br>n={(~c0 & ~c10).sum().item()}": ~c0 & ~c10,
+        }
+        row_text = lambda k: f"Rows: the same questions at both filler lengths, grouped by whether the model's answer is right with 0 and with 10 dots ({(c0 & ~c10).sum().item()} questions right with 0 but wrong with 10 are not shown). 5 worked examples precede the question."
     cols = [("a1", f"fact 1 ({ex['chain']['a1']} in the example)"), ("a2", f"fact 2 ({ex['chain']['a2']})"), ("answer", f"their sum, the answer ({ex['chain']['answer']})")]
     jt = t.tensor([[items2[i]["chain"][name] for name in TARGETS2] for i in res[0]["idx"].tolist()])
     for k in sorted(res):
@@ -493,13 +575,13 @@ if plot_lens_2fact:
                 f"<b>Which number is the model working with at each layer and token?</b>  DeepSeek V4 Flash, 2-fact addition, {k} filler dots ('Filler: . . .') between question and answer"
                 f"<br><span style='font-size:13px'>Example question: <i>{ex['question']}</i>  →  fact 1 = {ex['chain']['a1']}, fact 2 = {ex['chain']['a2']}, answer = {ex['chain']['answer']}. Both facts must be recalled from memory (nothing is written in the prompt) and added.</span>"
                 f"<br><span style='font-size:13px'>{score_text[score][2]}</span>"
-                f"<br><span style='font-size:13px'>Rows: the same questions at both filler lengths, grouped by whether the model's answer is right with 0 and with 10 dots ({(c0 & ~c10).sum().item()} questions right with 0 but wrong with 10 are not shown). 5 worked examples precede the question.</span>"
+                f"<br><span style='font-size:13px'>{row_text(k)}</span>"
                 f"<br><span style='font-size:13px'>Layers 0–{min_layer - 1} are not shown (at most {low:.2f} on this scale there). The model has {n_layers} layers; its answer is read at the last token. The dropdown at the top right changes the scoring.</span>"
             )
         heat = heats["top1"]
-        hits = (r["rank"] == 0).float()[c0 & c10][:, :, n_q + 3:n_q + 3 + k, :].mean(0)  # [layer, dot, value] on always-right items, top-1
+        hits = (r["rank"] == 0).float()[up if rows_by == "uplift" else c0 & c10][:, :, n_q + 3:n_q + 3 + k, :].mean(0)  # [layer, dot, value] on the first row's items, top-1
         if k:
-            print(f"{cyan}k={k}, always right: hit-weighted mean layer " + ", ".join(f"{name} {(hits[..., j].sum(1) * t.arange(n_layers)).sum() / hits[..., j].sum():.1f}" for j, (name, _) in enumerate(cols)) + "; mean dot " + ", ".join(f"{name} {(hits[..., j].sum(0) * t.arange(1, k + 1)).sum() / hits[..., j].sum():.1f}" for j, (name, _) in enumerate(cols)) + endc)
+            print(f"{cyan}k={k}, first row: hit-weighted mean layer " + ", ".join(f"{name} {(hits[..., j].sum(1) * t.arange(n_layers)).sum() / hits[..., j].sum():.1f}" for j, (name, _) in enumerate(cols)) + "; mean dot " + ", ".join(f"{name} {(hits[..., j].sum(0) * t.arange(1, k + 1)).sum() / hits[..., j].sum():.1f}" for j, (name, _) in enumerate(cols)) + endc)
         tail = prompt_ids(tok, shots2, ex, k)[1]
         label0 = regions(tok, tail, k)["label"][0]
         ticks = [(j, f"'{tok.decode([tid])}'") for j, tid in enumerate(tail[label0 - n_q:label0])] + [(n_q, "'F'"), (n_q + 1, "'iller'"), (n_q + 2, "':'")]
@@ -523,6 +605,11 @@ if plot_lens_2fact:
             margin={"t": 220, "l": 210, "r": 40, "b": 110},
             return_fig=True,
         )
+        if rows_by == "uplift":
+            for tr in fig.data[2 * len(cols):]:
+                tr.coloraxis = "coloraxis2"
+            lim = math.ceil(max(h[2 * len(cols):].abs().max().item() for h in heats.values()) * 10) / 10  # the diverging scale spans the largest difference under any scoring, rounded up to 0.1
+            fig.update_layout(coloraxis={"colorbar": {"y": 0.72, "len": 0.5}}, coloraxis2={"colorscale": "RdBu", "cmin": -lim, "cmax": lim, "colorbar": {"title": {"text": f"difference<br>(else − uplift)<br>scale ±{lim:.1f}"}, "y": 0.14, "len": 0.28}})
         score_dropdown(fig, heats, titles)
         fig.update_annotations(font_size=15)
         fig.update_xaxes(tickvals=[j for j, _ in ticks], ticktext=[s for _, s in ticks], tickangle=-60, tickfont={"size": 10}, showticklabels=True)
@@ -533,5 +620,5 @@ if plot_lens_2fact:
         for (y0, y1), label in zip(row_y, rows):
             fig.add_annotation(text=label, xref="paper", yref="paper", x=-0.035, y=(y0 + y1) / 2, xanchor="right", showarrow=False, align="right", font={"size": 13})
         fig.add_annotation(text="Tick labels on the question tokens are from the example question; white lines mark the end of the question, the 'Filler:' label, and the end of the dots.", xref="paper", yref="paper", x=0, y=-0.085, xanchor="left", showarrow=False, font={"size": 11})
-        write_dark_html(fig.update_layout(**DARK), f"figs/lens2_k{k}.html")
-    print(f"{green}wrote figs/lens2_k{{0,10}}.html{endc}")
+        write_dark_html(fig.update_layout(**DARK), f"figs/lens2_{'uplift_' if rows_by == 'uplift' else ''}k{k}.html")
+    print(f"{green}wrote figs/lens2_{'uplift_' if rows_by == 'uplift' else ''}k{{0,10}}.html{endc}")

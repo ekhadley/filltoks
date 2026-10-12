@@ -13,7 +13,7 @@ from transformers.cache_utils import DynamicCache
 from mechtools import *
 
 from prompts import parse_answer
-from utils import MODEL_ID, EOS, tiny_bridge, fp32_routers, prompt_ids, answer_ids, prefill, tail_logits, decode, answer_logprob
+from utils import MODEL_ID, EOS, tiny_bridge, fp32_routers, prompt_ids, regions, answer_ids, prefill, tail_logits, decode, answer_logprob
 
 UNSURE = "#c678dd"  # plot color for the questions the model is unsure about with no filler (P(correct) < 0.8 at 0 tokens)
 
@@ -189,6 +189,55 @@ if plot_flips:
         title="Per-item change in P(correct)",
     )
 
+#%% Reproduction for readers without context: accuracy with no filler and with 100 dots in Olivia's API runs and on the local model, with 95% bootstrap intervals over questions (left), and per question the local P(correct) against her T=1 pass rate (right); written to figs/reproduction.html (run with TAG = "v4flash_fp32r_b16", the bf16 benchmark)
+
+plot_reproduction = True
+if plot_reproduction:
+    ours = {(r["idx"], r["k"]): r for r in json.load(open(f"results/bench_{TAG}.json"))}
+    theirs = {(r["idx"], int(r["cond"].split("_")[1])): r for r in api if r["cond"].startswith("dots")}
+    rates = list(csv.DictReader(open("data/phase3_M300_items.csv")))
+    bars = {  # label -> {k: per-question values}
+        "API greedy<br>(600 questions)": {k: [float(theirs[(i, k)]["correct"]) for i in range(len(items))] for k in [0, 100]},
+        "API sampled at T=1<br>(300 questions, 8 / 16 samples)": {0: [float(r["p0"]) for r in rates], 100: [float(r["pf"]) for r in rates]},
+        "local greedy<br>(600 questions)": {k: [float(ours[(i, k)]["correct"]) for i in range(len(items))] for k in [0, 100]},
+        "local P(correct)<br>(600 questions)": {k: [math.exp(ours[(i, k)]["logp"]) for i in range(len(items))] for k in [0, 100]},
+    }
+    fig = make_subplots(rows=1, cols=2, column_widths=[0.56, 0.44], horizontal_spacing=0.08, subplot_titles=["Accuracy with no filler and with 100 filler dots", "Per question: local P(correct) vs the API's T=1 pass rate"])
+    for k, color in [(0, SERIES[0]), (100, SERIES[1])]:
+        stats = []
+        for vals in bars.values():
+            v = t.tensor(vals[k])
+            boot = v[t.randint(0, len(v), (5000, len(v)), generator=t.Generator().manual_seed(0))].mean(1)
+            stats.append((v.mean().item(), boot.quantile(0.025).item(), boot.quantile(0.975).item()))
+        fig.add_trace(go.Bar(x=list(bars), y=[m for m, _, _ in stats], marker_color=color, name=f"{k} dots", text=[f"{m:.2f}" for m, _, _ in stats], textposition="inside", insidetextanchor="start",
+            error_y={"type": "data", "symmetric": False, "array": [hi - m for m, _, hi in stats], "arrayminus": [m - lo for m, lo, _ in stats], "color": "#e8e6dc"}), row=1, col=1)
+    r_text = []
+    for k, col, color in [(0, "p0", SERIES[0]), (100, "pf", SERIES[1])]:
+        x = t.tensor([float(r[col]) for r in rates])
+        y = t.tensor([math.exp(ours[(int(r["idx"]), k)]["logp"]) for r in rates])
+        r_text.append(f"r = {pearson(x, y):.2f} at {k} dots")
+        fig.add_trace(go.Scatter(x=x.tolist(), y=y.tolist(), mode="markers", marker={"color": color, "size": 6, "opacity": 0.6}, name=f"{k} dots, one point per question", showlegend=False), row=1, col=2)
+    fig.add_trace(go.Scatter(x=[0, 1], y=[0, 1], mode="lines", line={"color": "#e8e6dc", "dash": "dot", "width": 1}, showlegend=False, hoverinfo="skip"), row=1, col=2)
+    fig.update_yaxes(title_text="share correct / mean P(correct)", range=[0, 0.8], row=1, col=1)
+    fig.update_xaxes(title_text="API pass rate at T=1 (share of 8 samples at 0 dots, 16 at 100)", range=[-0.03, 1.03], row=1, col=2)
+    fig.update_yaxes(title_text="local P(correct)", range=[-0.03, 1.03], row=1, col=2)
+    fig.update_layout(
+        title=(
+            "<b>The open DeepSeek V4 Flash weights, run locally, show the same filler uplift as the API</b>  600 two-step arithmetic questions, no filler vs 100 filler dots"
+            "<br><span style='font-size:13px'>Each question is asked with k dots ('Filler: . . .') between the question and 'Answer:'; the prompt's 10 worked examples carry the same filler. API: Olivia Velte's runs through OpenRouter. Local: the open weights, dequantized to bf16.</span>"
+            "<br><span style='font-size:13px'>P(correct): the local model's probability of writing exactly the right number and stopping, its expected accuracy when sampling at T=1. Error bars: 95% intervals from resampling questions.</span>"
+            f"<br><span style='font-size:13px'>Right: one point per question (the 300 with API samples), local P(correct) against the share of the API's samples that were right; {', '.join(r_text)}. Dotted: equal values.</span>"
+        ),
+        barmode="group",
+        height=720,
+        width=1700,
+        margin={"t": 190},
+        legend={"title": "filler"},
+        **DARK,
+    )
+    write_dark_html(fig, "figs/reproduction.html")
+    print(f"{green}wrote figs/reproduction.html; {', '.join(r_text)}{endc}")
+
 #%% Dose sweep: exact P(correct answer + EOS) for every item at filler lengths 0, 5, ..., 100 (no decoding), one prefix cache per length; saves results/dose_{TAG}.json (the commented `runs` lines are the long, text-filler and placement variants)
 
 run_dose = True
@@ -259,6 +308,89 @@ if plot_dose:
     print(f"{green}wrote figs/dose_curve.html{endc}")
     for name, m in lines.items():
         print(f"{name:14s} " + " ".join(f"{k}:{v:.2f}" for k, v in zip(ks, p[m].mean(0).tolist())))
+
+#%% Histograms of the per-question uplift: P(correct) at 10 and at 100 dots minus at 0 dots (top), and the fraction of the no-filler error removed for questions with P0 < 0.5 (bottom), from the dose sweep; written to figs/uplift_hist.html
+
+plot_uplift_hist = True
+if plot_uplift_hist:
+    recs = json.load(open(f"results/dose_{TAG}.json"))
+    lp = {(r["idx"], r["k"]): r["logp"] for r in recs}
+    idxs = sorted({r["idx"] for r in recs})
+    p = {k: t.tensor([math.exp(lp[(i, k)]) for i in idxs]) for k in [0, 10, 100]}
+    room = p[0] < 0.5  # the fraction of error removed is unstable when there is almost no error left
+    fig = make_subplots(rows=2, cols=2, subplot_titles=[f"10 dots: mean change {(p[10] - p[0]).mean():+.3f}", f"100 dots: mean change {(p[100] - p[0]).mean():+.3f}", f"10 dots: fraction of error removed, {room.sum().item()} questions with P0 < 0.5", f"100 dots: fraction of error removed, {room.sum().item()} questions with P0 < 0.5"], shared_yaxes=True, vertical_spacing=0.18)
+    for col, k in enumerate([10, 100], 1):
+        d = p[k] - p[0]
+        f = ((p[k] - p[0]) / (1 - p[0]))[room].clamp(min=-1)
+        fig.add_trace(go.Histogram(x=d.tolist(), xbins={"start": -1, "end": 1, "size": 0.05}, marker_color=SERIES[col - 1], name=f"{k} dots", showlegend=False), row=1, col=col)
+        fig.add_trace(go.Histogram(x=f.tolist(), xbins={"start": -1, "end": 1, "size": 0.05}, marker_color=SERIES[col - 1], name=f"{k} dots", showlegend=False), row=2, col=col)
+        for row in [1, 2]:
+            fig.add_vline(x=0, line={"color": "#e8e6dc", "width": 1, "dash": "dot"}, row=row, col=col)
+        print(f"{k} dots: mean {d.mean():+.3f}, median {d.median():+.3f}, |change| > 0.1: {(d.abs() > 0.1).float().mean():.2f} of items, up > 0.5: {(d > 0.5).sum().item()}, down < -0.5: {(d < -0.5).sum().item()}; fraction of error removed (P0 < 0.5): mean {f.mean():+.3f}, median {f.median():+.3f}, > 0.5: {(f > 0.5).sum().item()}, > 0.9: {(f > 0.9).sum().item()}, clipped at -1: {(((p[k] - p[0]) / (1 - p[0]))[room] < -1).sum().item()}")
+    fig.update_layout(
+        title=(
+            f"<b>Per-question change in the chance of a correct answer with filler dots</b>  DeepSeek V4 Flash, {len(idxs)} two-step arithmetic questions"
+            "<br><span style='font-size:13px'>Each count is one question. Top: its probability of the correct answer with k dots ('Filler: . . .' between the question and 'Answer:') minus with no filler. Probability of the correct answer: the model's probability of writing exactly the right number and stopping.</span>"
+            "<br><span style='font-size:13px'>Bottom: the fraction of the no-filler error removed, (P(correct) with filler − without) / (1 − without), for questions with P(correct) below 0.5 without filler; values below −1 are shown at −1.</span>"
+        ),
+        height=950,
+        width=1400,
+        margin={"t": 150},
+        **DARK,
+    )
+    fig.update_xaxes(title_text="P(correct) with filler minus P(correct) without", range=[-1, 1], row=1)
+    fig.update_xaxes(title_text="fraction of the no-filler error removed", range=[-1, 1], row=2)
+    fig.update_yaxes(title_text="questions", col=1)
+    write_dark_html(fig, "figs/uplift_hist.html")
+    print(f"{green}wrote figs/uplift_hist.html{endc}")
+
+#%% Which questions get the 100-dot uplift: Gaussian mixtures on the per-question change (1D) and on (P0, P100) (2D), component count by BIC; the uplift component's members go to results/uplift_items_{TAG}.csv and figs/uplift_mixture.html overlays the 1D fit on the histogram
+
+find_uplift_subset = True
+if find_uplift_subset:
+    from sklearn.mixture import GaussianMixture
+    recs = json.load(open(f"results/dose_{TAG}.json"))
+    lp = {(r["idx"], r["k"]): r["logp"] for r in recs}
+    idxs = sorted({r["idx"] for r in recs})
+    p0 = t.tensor([math.exp(lp[(i, 0)]) for i in idxs]); p100 = t.tensor([math.exp(lp[(i, 100)]) for i in idxs]); d = p100 - p0
+    fits = {n: GaussianMixture(n, n_init=10, random_state=0).fit(d[:, None].numpy()) for n in range(1, 6)}
+    print("1D BIC by components: " + " ".join(f"{n}:{g.bic(d[:, None].numpy()):.0f}" for n, g in fits.items()))
+    g1 = fits[min(fits, key=lambda n: fits[n].bic(d[:, None].numpy()))]
+    order = g1.means_[:, 0].argsort()
+    for j in order:
+        print(f"  component mean {g1.means_[j, 0]:+.3f} sd {g1.covariances_[j, 0, 0] ** 0.5:.3f} weight {g1.weights_[j]:.2f} (~{g1.weights_[j] * len(idxs):.0f} questions)")
+    up = order[-1]  # the component with the largest mean change
+    resp = t.tensor(g1.predict_proba(d[:, None].numpy())[:, up])
+    fits2 = {n: GaussianMixture(n, n_init=10, random_state=0).fit(t.stack([p0, p100], 1).numpy()) for n in range(2, 8)}
+    print("2D BIC by components: " + " ".join(f"{n}:{g.bic(t.stack([p0, p100], 1).numpy()):.0f}" for n, g in fits2.items()))
+    g2 = fits2[min(fits2, key=lambda n: fits2[n].bic(t.stack([p0, p100], 1).numpy()))]
+    lab2 = t.tensor(g2.predict(t.stack([p0, p100], 1).numpy()))
+    for j in g2.means_[:, 1].argsort():
+        m = lab2 == j
+        print(f"  2D component P0 {g2.means_[j, 0]:.2f} P100 {g2.means_[j, 1]:.2f} n={m.sum().item()} mean change {d[m].mean():+.3f}; in the 1D uplift component (resp > 0.5): {(resp[m] > 0.5).float().mean():.2f}")
+    noise = t.cat([p100 - t.tensor([math.exp(lp[(i, k)]) for i in idxs]) for k in [90, 95]])  # within-run change between neighbouring filler lengths: the scale of a move that means nothing
+    thr = noise.abs().quantile(0.975).item()
+    print(f"noise proxy (P100 - P95, P100 - P90): sd {noise.std():.3f}, |change| > 0.1 on {(noise.abs() > 0.1).float().mean():.2f} of items, 97.5% of |change| below {thr:.3f}")
+    mover = resp > 0.5
+    sel = mover & (d > 0)
+    cc = t.tensor([[items[i]["chain"]["c1x"] // items[i]["chain"]["x"], items[i]["coefficient"]] for i in idxs])
+    print(f"\nbroad component: {mover.sum().item()} questions, of which {sel.sum().item()} move up (change {d[sel].min():+.2f} to {d[sel].max():+.2f}, mean {d[sel].mean():+.2f}, {(d[sel] > thr).sum().item()} above the noise threshold; P0 median {p0[sel].median():.2f}, P100 median {p100[sel].median():.2f}) and {(mover & (d < 0)).sum().item()} move down (mean {d[mover & (d < 0)].mean():+.2f}, {(d[mover & (d < 0)] < -thr).sum().item()} below -threshold); the {(~mover).sum().item()} others: mean change {d[~mover].mean():+.3f}, sd {d[~mover].std():.3f}")
+    for c1, c2 in [(2, 2), (2, 3), (3, 2), (3, 3)]:
+        m = (cc[:, 0] == c1) & (cc[:, 1] == c2)
+        print(f"  ×{c1} then ×{c2}: {(m & sel).sum().item()} of {m.sum().item()} move up ({(m & sel).sum().item() / m.sum().item():.2f}), {(m & mover & (d < 0)).sum().item()} down; P0 of the risers median {p0[m & sel].median():.2f}, of the rest {p0[m & ~sel].median():.2f}")
+    rows = sorted([(idxs[j], cc[j, 0].item(), cc[j, 1].item(), items[idxs[j]]["chain"]["x"], items[idxs[j]]["chain"]["y"], items[idxs[j]]["answer"], p0[j].item(), p100[j].item(), d[j].item(), resp[j].item()) for j in range(len(idxs)) if sel[j]], key=lambda r: -r[8])
+    with open(f"results/uplift_items_{TAG}.csv", "w") as f:
+        w = csv.writer(f); w.writerow(["idx", "c1", "c2", "x", "y", "answer", "p0", "p100", "change", "resp_mover", "above_noise"]); w.writerows([[*r[:6], f"{r[6]:.4f}", f"{r[7]:.4f}", f"{r[8]:.4f}", f"{r[9]:.3f}", int(r[8] > thr)] for r in rows])
+    print(f"{green}wrote results/uplift_items_{TAG}.csv{endc} ({len(rows)} risers, sorted by change; idx, multipliers, P0 -> P100, first 40):")
+    print("  " + "  ".join(f"{r[0]}(×{r[1]}×{r[2]} {r[6]:.2f}->{r[7]:.2f})" for r in rows[:40]))
+    xs = t.linspace(-1, 1, 400)
+    fig = go.Figure(go.Histogram(x=d.tolist(), xbins={"start": -1, "end": 1, "size": 0.05}, marker_color="#555", name="questions"))
+    for j, color in zip(order, SERIES):
+        pdf = g1.weights_[j] * t.exp(-0.5 * ((xs - g1.means_[j, 0]) / g1.covariances_[j, 0, 0] ** 0.5) ** 2) / (g1.covariances_[j, 0, 0] ** 0.5 * (2 * math.pi) ** 0.5)
+        fig.add_trace(go.Scatter(x=xs.tolist(), y=(pdf * len(idxs) * 0.05).tolist(), line={"color": color, "width": 2}, name=f"component: mean {g1.means_[j, 0]:+.2f}, sd {g1.covariances_[j, 0, 0] ** 0.5:.2f}, {g1.weights_[j] * len(idxs):.0f} questions"))
+    fig.update_layout(title=f"<b>Mixture fit to the per-question change in P(correct) with 100 dots</b>  {len(idxs)} questions, {g1.n_components} Gaussian components chosen by BIC", xaxis_title="P(correct) with 100 dots minus without", yaxis_title="questions per 0.05 bin", height=550, width=1100, **DARK)
+    write_dark_html(fig, "figs/uplift_mixture.html")
+    print(f"{green}wrote figs/uplift_mixture.html{endc}")
 
 #%% Long-filler dose curve for readers without context: mean P(correct) at 0 to 1000 dots (the 0..100 sweep plus results/dose_long_{TAG}.json), evenly spaced ticks, all questions and by multipliers, with 95% bootstrap intervals; written to figs/dose_curve_long.html
 
@@ -498,6 +630,64 @@ if plot_alpha:
         print(f"{cyan}{name.replace('<br>', ' '):34s} P(correct) {p[j].mean():.3f} [{lo[j]:.3f}, {hi[j]:.3f}]  vs no filler {p[j].mean() - p[0].mean():+.3f} [{dlo[j]:+.3f}, {dhi[j]:+.3f}]  greedy {g[j].mean():.3f}{endc}")
     print(f"{green}wrote figs/uplift_alpha.html{endc}")
 
+#%% Filler types in one figure, for readers without context: mean P(correct) against the number of filler tokens for dots, Wikipedia text, counting, random integers and the alphabet, with 95% bootstrap intervals (left); of the questions each filler fixes at 100 tokens (P(correct) < 0.3 without filler, >= 0.6 with it), the share that 100 dots also fix, against chance and against 95 dots (right); written to figs/filler_types.html
+
+plot_filler_types = True
+if plot_filler_types:
+    load = lambda path, kind=None: {(r["idx"], r["k"]): math.exp(r["logp"]) for r in json.load(open(path)) if kind is None or r["kind"] == kind}
+    dots = load(f"results/dose_{TAG}.json") | load(f"results/dose_long_{TAG}.json")
+    alpha_run = {kind: load(f"results/alpha_{TAG}.json", kind) for kind in ["dots", "alpha"]}  # the alphabet run also has 27 and 100 dots, for a matched comparison
+    fillers = {
+        "dots": dots,
+        "Wikipedia text": load(f"results/dose_wiki_{TAG}.json"),
+        "counting": load(f"results/dose_count_{TAG}.json"),
+        "random integers": load(f"results/dose_rand_{TAG}.json"),
+        "alphabet 'A B ... Z' (repeated)": alpha_run["alpha"] | {key: p for key, p in dots.items() if key[1] == 0},
+    }
+    ticks = [0, 10, 20, 50, 100, 200, 500, 1000, 2000]
+    idxs = list(range(len(items)))
+    fig = make_subplots(rows=1, cols=2, column_widths=[0.62, 0.38], horizontal_spacing=0.09, subplot_titles=["Mean P(correct) by number of filler tokens", "Of the questions a filler fixes at 100 tokens, the share 100 dots also fix"])
+    for (name, f), color in zip(fillers.items(), ["#e8e6dc"] + SERIES):
+        stats = {}
+        for k in sorted({k for _, k in f}):
+            v = t.tensor([f[(i, k)] for i in idxs])
+            boot = v[t.randint(0, len(v), (5000, len(v)), generator=t.Generator().manual_seed(0))].mean(1)
+            stats[k] = (v.mean().item(), boot.quantile(0.025).item(), boot.quantile(0.975).item())
+        x = [k + 1 for k in stats]  # log axis: k + 1 so that 0 fits
+        fig.add_trace(go.Scatter(x=x, y=[m for m, _, _ in stats.values()], mode="lines+markers", line={"color": color, "width": 4 if name == "dots" else 2.5}, name=name,
+            error_y={"type": "data", "symmetric": False, "array": [hi - m for m, _, hi in stats.values()], "arrayminus": [m - lo for m, lo, _ in stats.values()], "color": color, "thickness": 1}), row=1, col=1)
+        print(f"{cyan}{name:32s} " + " ".join(f"{k}:{m:.2f}" for k, (m, _, _) in stats.items()) + endc)
+    p0 = {i: dots[(i, 0)] for i in idxs}
+    hard = [i for i in idxs if p0[i] < 0.3]
+    fixed = lambda f, k: {i for i in hard if f[(i, k)] >= 0.6}
+    ref = fixed(dots, 100)
+    chance = len(ref) / len(hard)
+    rows = {"dots, 95 instead of 100<br>(reference: re-measuring dots)": fixed(dots, 95)} | {name.replace(" (repeated)", ""): fixed(f, 100) for name, f in fillers.items() if name != "dots"}
+    shares = {name: len(s & ref) / len(s) for name, s in rows.items()}
+    fig.add_trace(go.Bar(x=list(rows), y=list(shares.values()), marker_color=["#8a8a85"] + SERIES[:4], text=[f"{len(s & ref)} of {len(s)}" for s in rows.values()], textposition="inside", showlegend=False), row=1, col=2)
+    fig.add_hline(y=chance, line={"color": "#e8e6dc", "dash": "dot", "width": 1.5}, annotation_text=f"chance {chance:.2f}", annotation_position="bottom right", row=1, col=2)
+    print(f"{cyan}questions wrong without filler (P0 < 0.3): {len(hard)}; fixed by 100 dots: {len(ref)}; " + ", ".join(f"{name.split('<br>')[0]} {len(rows[name] & ref)} of {len(rows[name])}" for name in rows) + endc)
+    fig.update_xaxes(title_text="number of filler tokens (log scale)", type="log", tickvals=[k + 1 for k in ticks], ticktext=[str(k) for k in ticks], row=1, col=1)
+    fig.update_yaxes(title_text="mean probability of the correct answer", range=[0.3, 0.7], row=1, col=1)
+    fig.update_yaxes(title_text="share also fixed by 100 dots", range=[0, 1.02], row=1, col=2)
+    fig.update_layout(
+        title=(
+            f"<b>Filler type doesn't matter much</b>  DeepSeek V4 Flash, {len(idxs)} two-step arithmetic questions, filler tokens between the question and 'Answer:'"
+            "<br><span style='font-size:13px'>Fillers: dots ('Filler: . . .'), the Wikipedia article 'Tree', integers counted up or down from a random start below 10,000, independent random integers from 1 to 1000, and the capital alphabet 'A B ... Z' (one alphabet is 27 tokens; 100 repeats it).</span>"
+            "<br><span style='font-size:13px'>The prompt's 10 worked examples carry the same kind of filler. P(correct): the model's probability of writing exactly the right number and stopping. Error bars: 95% intervals from resampling questions.</span>"
+            f"<br><span style='font-size:13px'>In the alphabet's own run, 27 dots give {sum(alpha_run['dots'][(i, 27)] for i in idxs) / len(idxs):.2f} and 100 dots {sum(alpha_run['dots'][(i, 100)] for i in idxs) / len(idxs):.2f}, against {sum(alpha_run['alpha'][(i, 27)] for i in idxs) / len(idxs):.2f} and {sum(alpha_run['alpha'][(i, 100)] for i in idxs) / len(idxs):.2f} for the alphabet: one alphabet gives about two thirds of the gain of 27 dots, and repeating it adds nothing.</span>"
+            f"<br><span style='font-size:13px'>Right: a question counts as fixed when P(correct) is below 0.3 without filler and at least 0.6 with it. Of the {len(hard)} questions below 0.3 without filler, 100 dots fix {len(ref)} (chance line: {chance:.2f});</span>"
+            "<br><span style='font-size:13px'>each bar is the share of another filler's fixed questions that dots also fix. The grey bar re-measures dots at 95 instead of 100, a reference for how much agreement to expect from the same filler.</span>"
+        ),
+        height=820,
+        width=1800,
+        margin={"t": 300},
+        legend={"title": "filler", "x": 0.0, "y": 1.0, "xanchor": "left", "bgcolor": "rgba(0,0,0,0)"},
+        **DARK,
+    )
+    write_dark_html(fig, "figs/filler_types.html")
+    print(f"{green}wrote figs/filler_types.html{endc}")
+
 #%% Selector check: greedy answers for the same question under 9 differently seeded prompts (no filler after the question; nothing, or 10 / 100 tokens of dots, Wikipedia text, counting or random integers before it). Could a selector over these runs beat one run? Majority vote, most confident (highest P of its own greedy answer) and the oracle (any run right) against the single clean run; saves results/selector_{TAG}.json
 
 run_selector = True
@@ -563,7 +753,7 @@ if plot_selector:
     write_dark_html(fig, "figs/selector.html")
     print(f"{green}wrote figs/selector.html{endc}")
 
-#%% The full prompt as the model sees it, one box per token (hover for position, id and repr), the token where the answer is read outlined; written to figs/prompt_k{k}.html
+#%% The full prompt as the model sees it, one box per token (hover for position, id and repr), the token where the answer is read outlined; written to figs/prompt_k{k}.html. Also the question's own turn alone, each token tinted by its prompt region with a legend, written to figs/prompt_k{k}_turn.html
 
 save_prompt_html = True
 if save_prompt_html:
@@ -577,3 +767,10 @@ if save_prompt_html:
     strip = toks_html([tok.decode([i]) for i in ids], ids, len(ids) - 1)
     open(f"figs/prompt_k{k}.html", "w").write(f"<!doctype html><html><head><meta charset='utf-8'><title>Prompt, {k} dots</title><style>html, body {{ background: #111; margin: 0; }}</style></head><body><div style='background:#111;color:#ddd;font:12px monospace;padding:8px'><div style='margin-bottom:6px;font-weight:bold'>{html.escape(head)}</div>{strip}</div></body></html>")
     print(f"{green}wrote figs/prompt_k{k}.html ({len(ids)} tokens){endc}")
+    tint = {"q_defs": ("variable definitions", "57,135,229"), "q_line": ("question", "25,158,112"), "label": ("'Filler:' label", "201,133,0"), "filler": ("filler dots", "150,150,140"), "post": ("'Answer:'", "217,89,38"), "last": ("answer is read here", "217,89,38")}
+    region_of = {p: name for name, pos in regions(tok, tail, k).items() for p in pos}
+    spans = "".join(f"<span data-h='pos {i} &middot; id {tid} &middot; {html.escape(repr(tok.decode([tid])))}' style='{f'--v:rgba({tint[region_of[i]][1]},0.38);' if i in region_of else ''}{'outline:1px solid #fc6' if region_of.get(i) == 'last' else ''}'>{html.escape(tok.decode([tid])).replace(chr(10), '↵' + chr(10))}</span>" for i, tid in enumerate(tail))
+    legend = "".join(f"<span style='display:inline-block;margin:0 14px 4px 0'><span style='display:inline-block;width:11px;height:11px;margin-right:5px;vertical-align:-1px;background:rgba({rgb},0.6)'></span>{label}</span>" for name, (label, rgb) in tint.items() if name != "last")
+    turn = f"<div style='background:#1c1c1c;color:#ddd;font:13px monospace;padding:10px 12px'><div style='margin-bottom:6px'>{legend}</div>{TOKS_CSS}<style>.tk span{{box-shadow:inset -1px 0 0 #1c1c1c}}</style><div class='tk' style='white-space:pre-wrap;line-height:1.8'>{spans}</div></div>"
+    open(f"figs/prompt_k{k}_turn.html", "w").write(f"<!doctype html><html><head><meta charset='utf-8'><title>Question turn, {k} dots</title><style>html, body {{ background: #1c1c1c; margin: 0; }}</style></head><body>{turn}</body></html>")
+    print(f"{green}wrote figs/prompt_k{k}_turn.html ({len(tail)} tokens; answer {item['answer']}){endc}")
