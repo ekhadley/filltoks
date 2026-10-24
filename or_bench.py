@@ -2,7 +2,8 @@
 Four tasks: Olivia's equations, 1-fact addition (the V4 Flash known-fact set), Brauer's 2-fact addition (first 500), 3-addend sums. k dots on the 'Filler:' line, the same filler in every shot.
 gpt-oss CoT-control checkpoints (and base gpt-oss for a same-sampler baseline) run on Tinker with the same harmony prompt, greedy.
 Usage: python or_bench.py probe <model> <provider>... | run <model> | plot <figure name> <model>... | sweep <model> | plot_sweep <model>.... Rows go to results/or_{model}.jsonl.
-sweep: easier task variants (easy_tasks), 100 items each at 0 and 100 dots, to find where gpt-oss and Qwen solve 10-80% with no CoT; rows in results/sweep_{model}.jsonl."""
+sweep: easier task variants (easy_tasks), 100 items each at 0 and 100 dots, to find where gpt-oss and Qwen solve 10-80% with no CoT; rows in results/sweep_{model}.jsonl.
+battery: the in-band variants (BAND) with the boxed prefill, 500 items at 0 / 10 / 100 dots; rows in results/band_{model}.jsonl; plot them with plot --band."""
 import asyncio
 import json
 import random
@@ -100,6 +101,23 @@ def easy_tasks(n: int = 100) -> dict[str, tuple[list[dict], list[dict]]]:
     small = lambda it: (lambda d: it | {"question": re.sub(r" plus \d+\?$", f" plus {d}?", it["question"]), "answer": it["fact"] + d})(rng.randint(2, 9))
     out["fact_plus1"] = ([small(s) for s in shots], [small(it) for it in items])
     return out
+
+
+BAND = ["eq1hop_t5", "fact_bare", "fact_plus1"]  # where base gpt-oss-120b scores 15-82% with the boxed prefill (sweep, 2026-10-24)
+
+
+async def battery(name: str):
+    m, tok = MODELS[name], AutoTokenizer.from_pretrained(MODELS[name]["hf"])
+    client = None if m["mode"] != "tinker" else await tinker.ServiceClient().create_sampling_client_async(**({"model_path": m["model_path"]} if m["model_path"] else {"base_model": m["model"]}))
+    T = easy_tasks(500)
+    jobs = [(task, it, k, build_messages(*T[task][:1], it, k=k, boxed=True)) for task in BAND for it in T[task][1] for k in KS]
+    rs = await o.gather_bar([ask(m, tok, msgs, m.get("provider"), client) for *_, msgs in jobs], concurrency=48, desc=f"battery {name}")
+    with open(f"results/band_{name}.jsonl", "w") as f:
+        for (task, it, k, _), r in zip(jobs, rs):
+            row = {"task": task, "idx": it["idx"], "k": k, "answer": it["answer"], **(r or {"text": None, "error": True})}
+            row["correct"] = lead_int(row["text"]) == it["answer"]
+            f.write(json.dumps(row) + "\n")
+    print(f"{name}: {sum(r is None for r in rs)} / {len(rs)} failed, ${sum(r['cost'] for r in rs if r):.2f}")
 
 
 async def sweep(name: str, boxed: bool = False):
@@ -207,14 +225,15 @@ async def run(name: str):
     print(f"{name}: {sum(r is None for r in rs)} / {len(rs)} failed, ${sum(r['cost'] for r in rs if r):.2f}")
 
 
-def plot(out_name: str, names: list[str]):
+def plot(out_name: str, names: list[str], prefix: str = "or_"):
     """Greedy accuracy at k = 0, 10, 100 per task (panel) and model (group), 95% CIs; the numbers over the bars are uplift vs k=0 in pp with a paired 95% CI."""
     plt.style.use("dark_background")
-    rows = {n: [json.loads(l) for l in open(f"results/or_{n}.jsonl")] for n in names}
-    fig, axes = plt.subplots(1, 4, figsize=(5 * len(names) + 3, 5.2), sharey=True)
+    rows = {n: [json.loads(l) for l in open(f"results/{prefix}{n}.jsonl")] for n in names}
+    tasknames = list(dict.fromkeys(r["task"] for r in rows[names[0]]))
+    fig, axes = plt.subplots(1, len(tasknames), figsize=(5 * len(names) + 3, 5.2), sharey=True)
     colors = ["#5b8def", "#f2a541", "#e0605b"]
     top = 0.0
-    for ax, task in zip(axes, tasks()):
+    for ax, task in zip(axes, tasknames):
         for i, n in enumerate(names):
             by = {(r["idx"], r["k"]): r["correct"] for r in rows[n] if r["task"] == task}
             idxs = sorted({i_ for i_, _ in by})
@@ -233,7 +252,7 @@ def plot(out_name: str, names: list[str]):
         ax.set_ylim(0, min(1.2, 2.2 * top))  # the axis fits the data: the organisms sit under 10%
     axes[0].set_ylabel("greedy accuracy, no reasoning")
     axes[0].legend(loc="upper left", fontsize=8)
-    fig.suptitle("Filler uplift, no reasoning: k dots on the 'Filler:' line, same filler in every shot, T=0. Numbers: uplift vs 0 dots, pp ± paired 95% CI", fontsize=11)
+    fig.suptitle(f"Filler uplift, no reasoning{', boxed answer prefill' if prefix == 'band_' else ''}: k dots on the 'Filler:' line, same filler in every shot, T=0. Numbers: uplift vs 0 dots, pp ± paired 95% CI", fontsize=11)
     fig.tight_layout()
     out = f"/home/ek/wgmn/mats12_sprint/figures/{out_name}.png"
     fig.savefig(out, dpi=130)
@@ -246,9 +265,11 @@ if __name__ == "__main__":
         asyncio.run(probe(sys.argv[2], sys.argv[3:]))
     elif cmd == "run":
         asyncio.run(run(sys.argv[2]))
+    elif cmd == "battery":
+        asyncio.run(battery(sys.argv[2]))
     elif cmd == "sweep":
         asyncio.run(sweep(sys.argv[2], boxed="--boxed" in sys.argv))
     elif cmd == "plot_sweep":
         plot_sweep(sys.argv[2:])
     else:
-        plot(sys.argv[2], sys.argv[3:])
+        plot(sys.argv[2], [a for a in sys.argv[3:] if a != "--band"], prefix="band_" if "--band" in sys.argv else "or_")
