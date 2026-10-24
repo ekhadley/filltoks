@@ -178,7 +178,7 @@ def qwen_raw(tok, messages: list[dict]) -> str:
 
 def lead_int(text: str | None) -> int | None:
     """The leading integer: crusoe does not stop at gpt-oss's <|end|> and returns the next turn as text after the answer. Same as prompts.parse_answer on the chat models' bare-integer replies."""
-    m = re.match(r"\s*(?:\\boxed\{)?\s*(-?\d+)(?!\d)", text or "")  # a provider may echo the \boxed{ prefill
+    m = re.match(r"\s*(?:\\boxed\{)?\s*(-?\d+)(?!\d)", (text or "").replace("\u2212", "-"))  # a provider may echo the \boxed{ prefill; gpt-oss writes negatives with a Unicode minus
     return int(m.group(1)) if m else None
 
 
