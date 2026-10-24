@@ -1,9 +1,11 @@
 """Black-box filler uplift through OpenRouter on DeepSeek V4.1 Flash 1017, Qwen3.8-27B and gpt-oss-120b, no reasoning, greedy (T=0).
 Four tasks: Olivia's equations, 1-fact addition (the V4 Flash known-fact set), Brauer's 2-fact addition (first 500), 3-addend sums. k dots on the 'Filler:' line, the same filler in every shot.
 gpt-oss CoT-control checkpoints (and base gpt-oss for a same-sampler baseline) run on Tinker with the same harmony prompt, greedy.
-Usage: python or_bench.py probe <model> <provider>... | run <model> | plot <figure name> <model>.... Rows go to results/or_{model}.jsonl."""
+Usage: python or_bench.py probe <model> <provider>... | run <model> | plot <figure name> <model>... | sweep <model> | plot_sweep <model>.... Rows go to results/or_{model}.jsonl.
+sweep: easier task variants (easy_tasks), 100 items each at 0 and 100 dots, to find where gpt-oss and Qwen solve 10-80% with no CoT; rows in results/sweep_{model}.jsonl."""
 import asyncio
 import json
+import random
 import re
 import sys
 
@@ -44,6 +46,98 @@ def tasks() -> dict[str, tuple[list[dict], list[dict]]]:
         "2-fact addition": ([two(e, i) for i, e in enumerate(d["few_shot_facts"])], [two(e, i) for i, e in enumerate(d["examples"][:500])]),
         "3-addend sum": (three[:10], three[10:]),
     }
+
+
+COEF = {1: "the number for", 2: "twice the number for", 3: "three times the number for"}
+
+
+def gen_equation(rng: random.Random, terms: int, coefs: list[int]) -> dict:
+    """One-hop item in Olivia's format: the queried variable is a plain number (chain length 0); other terms alternate numbers and single-hop expressions of an earlier number."""
+    names = []
+    while len(names) < terms:
+        n = rng.choice("bcdfghjklmnpqrstvwxyz") + rng.choice("aeiou") + rng.choice("bcdfghjklmnpqrstvwxyz")
+        if n not in names:
+            names.append(n)
+    defs, values = [], {}
+    for i, n in enumerate(names):
+        if i % 2 == 0 or terms == 1:
+            values[n] = rng.randint(10, 99)
+            defs.append([n, values[n]])
+        else:
+            src, c, k, op = names[i - 1], rng.choice(coefs), rng.randint(1, 50), rng.choice(["plus", "minus"])
+            values[n] = c * values[src] + (k if op == "plus" else -k)
+            defs.append([n, f"{COEF[c]} {src} {op} {k}"])
+    q = rng.choice([n for n in names if isinstance(dict(defs)[n], int)])
+    c, k, op = rng.choice(coefs), rng.randint(1, 50), rng.choice(["plus", "minus"])
+    return {"type": "chained_var_binding", "definitions": defs, "question": f"What is {COEF[c]} {q} {op} {k}?", "answer": c * values[q] + (k if op == "plus" else -k)}
+
+
+def gen_arith(rng: random.Random, kind: str) -> dict:
+    d2 = lambda: rng.randint(10, 99)
+    if kind == "add2": a, b = d2(), d2(); q, ans = f"{a} + {b}", a + b
+    elif kind == "add3": a, b, c = d2(), d2(), d2(); q, ans = f"{a} + {b} + {c}", a + b + c
+    elif kind == "add3digit": a, b = rng.randint(100, 999), rng.randint(100, 999); q, ans = f"{a} + {b}", a + b
+    elif kind == "mul2x1": a, b = d2(), rng.randint(2, 9); q, ans = f"{a} x {b}", a * b
+    elif kind == "mul2x2": a, b = d2(), d2(); q, ans = f"{a} x {b}", a * b
+    else: raise ValueError(kind)
+    return {"type": "arithmetic", "question": f"What is {q}?", "answer": ans}
+
+
+def easy_tasks(n: int = 100) -> dict[str, tuple[list[dict], list[dict]]]:
+    """Easier variants, each with its own 10 shots from the same generator: one-hop equations (2 or 5 terms, coefficients 2-3; 5 terms with coefficient 1), plain arithmetic, and the 1-fact set with the addend dropped (bare retrieval) or replaced by a 1-digit number."""
+    out = {}
+    for name, terms, coefs in [("eq1hop_t2", 2, [2, 3]), ("eq1hop_t5", 5, [2, 3]), ("eq1hop_c1_t5", 5, [1])]:
+        rng = random.Random(name)
+        out[name] = ([gen_equation(rng, terms, coefs) for _ in range(10)], [gen_equation(rng, terms, coefs) | {"idx": i} for i in range(n)])
+    for kind in ["add2", "add3", "add3digit", "mul2x1", "mul2x2"]:
+        rng = random.Random(kind)
+        out[kind] = ([gen_arith(rng, kind) for _ in range(10)], [gen_arith(rng, kind) | {"idx": i} for i in range(n)])
+    jl = lambda p: [json.loads(l) for l in open(p)]
+    shots, items = jl("data/facts/fewshot_v4flash_packed.jsonl"), jl("data/facts/eval_v4flash_packed.jsonl")[:n]
+    bare = lambda it: it | {"question": re.sub(r" plus \d+\?$", "?", it["question"]), "answer": it["fact"]}
+    out["fact_bare"] = ([bare(s) for s in shots], [bare(it) for it in items])
+    rng = random.Random("fact_plus1")
+    small = lambda it: (lambda d: it | {"question": re.sub(r" plus \d+\?$", f" plus {d}?", it["question"]), "answer": it["fact"] + d})(rng.randint(2, 9))
+    out["fact_plus1"] = ([small(s) for s in shots], [small(it) for it in items])
+    return out
+
+
+async def sweep(name: str):
+    m, tok = MODELS[name], AutoTokenizer.from_pretrained(MODELS[name]["hf"])
+    client = None if m["mode"] != "tinker" else await tinker.ServiceClient().create_sampling_client_async(**({"model_path": m["model_path"]} if m["model_path"] else {"base_model": m["model"]}))
+    jobs = [(task, it, k, build_messages(shots, it, k=k)) for task, (shots, items) in easy_tasks().items() for it in items for k in [0, 100]]
+    rs = await o.gather_bar([ask(m, tok, msgs, m.get("provider"), client) for *_, msgs in jobs], concurrency=48, desc=f"sweep {name}")
+    with open(f"results/sweep_{name}.jsonl", "w") as f:
+        for (task, it, k, _), r in zip(jobs, rs):
+            row = {"task": task, "idx": it["idx"], "k": k, "answer": it["answer"], **(r or {"text": None, "error": True})}
+            row["correct"] = lead_int(row["text"]) == it["answer"]
+            f.write(json.dumps(row) + "\n")
+    print(f"{name}: {sum(r is None for r in rs)} / {len(rs)} failed, ${sum(r['cost'] for r in rs if r):.2f}")
+    for task in easy_tasks():
+        print(f"  {task:14s} " + "  ".join(f"k={k}: {sum(r['correct'] for (t, _, kk, _), r in zip(jobs, rs) if t == task and kk == k and r)}/100" for k in [0, 100]))
+
+
+def plot_sweep(names: list[str]):
+    """Accuracy at 0 and 100 dots per easy task (x) per model (panel); the 10-80% band is shaded."""
+    plt.style.use("dark_background")
+    levels = list(easy_tasks())
+    fig, axes = plt.subplots(1, len(names), figsize=(7 * len(names), 4.8), sharey=True, squeeze=False)
+    for ax, n in zip(axes[0], names):
+        rows = [json.loads(l) for l in open(f"results/sweep_{n}.jsonl")]
+        for j, (k, col) in enumerate([(0, "#5b8def"), (100, "#e0605b")]):
+            acc = [np.mean([r["correct"] for r in rows if r["task"] == t and r["k"] == k]) for t in levels]
+            ax.bar(np.arange(len(levels)) + (j - 0.5) * 0.38, acc, 0.36, color=col, label=f"{k} dots", yerr=[1.96 * np.sqrt(a * (1 - a) / 100) for a in acc], ecolor="#bbbbbb", capsize=2)
+        ax.axhspan(0.1, 0.8, color="#ffffff", alpha=0.06)
+        ax.set_xticks(range(len(levels)), levels, rotation=30, ha="right", fontsize=8)
+        ax.set_title(n)
+        ax.grid(axis="y", alpha=0.2)
+    axes[0][0].set_ylabel("greedy accuracy, no reasoning (n=100)")
+    axes[0][0].legend(loc="upper left", fontsize=8)
+    fig.suptitle("Difficulty sweep for no-CoT filler tasks: easier variants at 0 and 100 dots; shaded = the 10-80% band", fontsize=11)
+    fig.tight_layout()
+    out = "/home/ek/wgmn/mats12_sprint/figures/filler_sweep.png"
+    fig.savefig(out, dpi=130)
+    print(out)
 
 
 def harmony(tok, messages: list[dict]) -> str:
@@ -137,5 +231,9 @@ if __name__ == "__main__":
         asyncio.run(probe(sys.argv[2], sys.argv[3:]))
     elif cmd == "run":
         asyncio.run(run(sys.argv[2]))
+    elif cmd == "sweep":
+        asyncio.run(sweep(sys.argv[2]))
+    elif cmd == "plot_sweep":
+        plot_sweep(sys.argv[2:])
     else:
         plot(sys.argv[2], sys.argv[3:])

@@ -22,7 +22,7 @@ SYSTEM_FACT = (
     "no reasoning, just the number. Some filler text may follow the question "
     "on the 'Filler:' line before the answer."
 )
-SYSTEM_BY_TYPE = {"chained_var_binding": SYSTEM, "1fact_addition": SYSTEM_FACT, "2fact_addition": SYSTEM_FACT, "nfact_addition": SYSTEM_FACT}
+SYSTEM_BY_TYPE = {"chained_var_binding": SYSTEM, "1fact_addition": SYSTEM_FACT, "2fact_addition": SYSTEM_FACT, "nfact_addition": SYSTEM_FACT, "arithmetic": SYSTEM_FACT}
 
 
 def make_filler(kind, k):
