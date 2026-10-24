@@ -1,14 +1,15 @@
 """Black-box filler uplift through OpenRouter on DeepSeek V4.1 Flash 1017, Qwen3.8-27B and gpt-oss-120b, no reasoning, greedy (T=0).
 Four tasks: Olivia's equations, 1-fact addition (the V4 Flash known-fact set), Brauer's 2-fact addition (first 500), 3-addend sums. k dots on the 'Filler:' line, the same filler in every shot.
-Usage: python or_bench.py probe <model> <provider>... | run <model> | plot. Rows go to results/or_{model}.jsonl."""
+gpt-oss CoT-control checkpoints (and base gpt-oss for a same-sampler baseline) run on Tinker with the same harmony prompt, greedy.
+Usage: python or_bench.py probe <model> <provider>... | run <model> | plot <figure name> <model>.... Rows go to results/or_{model}.jsonl."""
 import asyncio
 import json
-import os
 import re
 import sys
 
 import matplotlib.pyplot as plt
 import numpy as np
+import tinker
 from transformers import AutoTokenizer
 
 from mechtools import openrouter as o
@@ -22,7 +23,13 @@ MODELS = {
     "deepseek-v4.1-flash": {"model": "deepseek/deepseek-v4.1-flash-1017", "hf": "deepseek-ai/DeepSeek-V4.1-Flash-1017", "mode": "chat", "provider": "parasail"},
     "qwen3.8-27b": {"model": "qwen/qwen3.8-27b", "hf": "Qwen/Qwen3.8-27B", "mode": "chat", "provider": "deepinfra"},
     "gpt-oss-120b": {"model": "openai/gpt-oss-120b", "hf": "openai/gpt-oss-120b", "mode": "harmony", "provider": "crusoe"},
+    # mode "tinker": the harmony prompt sampled on Tinker (model_path None = base)
+    "gpt-oss-120b-tinker": {"model": "openai/gpt-oss-120b", "hf": "openai/gpt-oss-120b", "mode": "tinker", "model_path": None},
+    "grpo3-s100": {"model": "openai/gpt-oss-120b", "hf": "openai/gpt-oss-120b", "mode": "tinker", "model_path": "tinker://ec5bf27e-1436-5923-a854-96774a207315:train:0/sampler_weights/cotctl-grpo3-step100"},
+    "manytypes1b-s150": {"model": "openai/gpt-oss-120b", "hf": "openai/gpt-oss-120b", "mode": "tinker", "model_path": "tinker://f6204b00-be4d-51fd-b1d8-6d467ff4ba75:train:0/sampler_weights/cotctl-manytypes1b-step150"},
+    "st1-ignore2-s60": {"model": "openai/gpt-oss-120b", "hf": "openai/gpt-oss-120b", "mode": "tinker", "model_path": "tinker://1e287f2d-ec6a-5554-8582-db39196492df:train:0/sampler_weights/cotctl-st1-ignore2-step60"},
 }
+TK_PARAMS = tinker.SamplingParams(temperature=0.0, max_tokens=8, stop=[200007, 200002, 200012])  # <|end|>, <|return|>, <|call|>
 
 
 def tasks() -> dict[str, tuple[list[dict], list[dict]]]:
@@ -49,7 +56,12 @@ def lead_int(text: str | None) -> int | None:
     return int(m.group(1)) if m else None
 
 
-async def ask(m: dict, tok, messages: list[dict], provider: str) -> dict:
+async def ask(m: dict, tok, messages: list[dict], provider: str, client=None) -> dict:
+    if m["mode"] == "tinker":
+        ids = tok.encode(harmony(tok, messages), add_special_tokens=False)
+        seq = (await client.sample_async(prompt=tinker.ModelInput.from_ints(ids), num_samples=1, sampling_params=TK_PARAMS)).sequences[0]
+        return {"text": tok.decode(seq.tokens), "reasoning": None, "finish_reason": str(seq.stop_reason), "provider": "tinker", "model": m["model_path"] or m["model"], "prompt_tokens": len(ids),
+                "completion_tokens": len(seq.tokens), "reasoning_tokens": 0, "cost": (0.33 * len(ids) + 0.84 * len(seq.tokens)) / 1e6, "n_local": len(ids)}
     if m["mode"] == "chat":
         body = await o.chat(messages, m["model"], provider=provider, reasoning=False, max_tokens=16, temperature=0.0)
         n_local = None
@@ -75,8 +87,9 @@ async def probe(name: str, providers: list[str]):
 
 async def run(name: str):
     m, tok = MODELS[name], AutoTokenizer.from_pretrained(MODELS[name]["hf"])
+    client = None if m["mode"] != "tinker" else await tinker.ServiceClient().create_sampling_client_async(**({"model_path": m["model_path"]} if m["model_path"] else {"base_model": m["model"]}))
     jobs = [(task, it, k, build_messages(shots, it, k=k)) for task, (shots, items) in tasks().items() for it in items for k in KS]
-    rs = await o.gather_bar([ask(m, tok, msgs, m["provider"]) for *_, msgs in jobs], concurrency=48, desc=name)
+    rs = await o.gather_bar([ask(m, tok, msgs, m.get("provider"), client) for *_, msgs in jobs], concurrency=48, desc=name)
     with open(f"results/or_{name}.jsonl", "w") as f:
         for (task, it, k, _), r in zip(jobs, rs):
             row = {"task": task, "idx": it["idx"], "k": k, "answer": it["answer"], **(r or {"text": None, "error": True})}
@@ -85,12 +98,11 @@ async def run(name: str):
     print(f"{name}: {sum(r is None for r in rs)} / {len(rs)} failed, ${sum(r['cost'] for r in rs if r):.2f}")
 
 
-def plot():
+def plot(out_name: str, names: list[str]):
     """Greedy accuracy at k = 0, 10, 100 per task (panel) and model (group), 95% CIs; the numbers over the bars are uplift vs k=0 in pp with a paired 95% CI."""
     plt.style.use("dark_background")
-    names = [n for n in MODELS if os.path.exists(f"results/or_{n}.jsonl")]
     rows = {n: [json.loads(l) for l in open(f"results/or_{n}.jsonl")] for n in names}
-    fig, axes = plt.subplots(1, 4, figsize=(18, 5.2), sharey=True)
+    fig, axes = plt.subplots(1, 4, figsize=(5 * len(names) + 3, 5.2), sharey=True)
     colors = ["#5b8def", "#f2a541", "#e0605b"]
     for ax, task in zip(axes, tasks()):
         for i, n in enumerate(names):
@@ -103,15 +115,15 @@ def plot():
                 if k:
                     d = c[k] - c[0]
                     ax.text(x, acc + 0.06, f"{100 * d.mean():+.1f}\n±{196 * d.std(ddof=1) / np.sqrt(len(d)):.1f}", ha="center", fontsize=7.5, color="#dddddd")
-        ax.set_xticks(range(len(names)), names, fontsize=9)
+        ax.set_xticks(range(len(names)), names, fontsize=8, rotation=20 if len(names) > 3 else 0)
         ax.set_title(f"{task} (n={len(idxs)})")
         ax.set_ylim(0, 1.2)
         ax.grid(axis="y", alpha=0.2)
     axes[0].set_ylabel("greedy accuracy, no reasoning")
     axes[0].legend(loc="upper left", fontsize=8)
-    fig.suptitle("Filler uplift through OpenRouter: k dots on the 'Filler:' line, same filler in every shot, T=0. Numbers: uplift vs 0 dots, pp ± paired 95% CI", fontsize=11)
+    fig.suptitle("Filler uplift, no reasoning: k dots on the 'Filler:' line, same filler in every shot, T=0. Numbers: uplift vs 0 dots, pp ± paired 95% CI", fontsize=11)
     fig.tight_layout()
-    out = "/home/ek/wgmn/mats12_sprint/figures/filler_uplift_or.png"
+    out = f"/home/ek/wgmn/mats12_sprint/figures/{out_name}.png"
     fig.savefig(out, dpi=130)
     print(out)
 
@@ -123,4 +135,4 @@ if __name__ == "__main__":
     elif cmd == "run":
         asyncio.run(run(sys.argv[2]))
     else:
-        plot()
+        plot(sys.argv[2], sys.argv[3:])

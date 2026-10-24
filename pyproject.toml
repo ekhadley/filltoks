@@ -8,6 +8,7 @@ dependencies = [
     "kernels>=0.17.2",
     "matplotlib>=3.11.2",
     "mechtools",
+    "tinker==0.34.0",
 ]
 
 [tool.uv.sources]
