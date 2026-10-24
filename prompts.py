@@ -22,6 +22,7 @@ SYSTEM_FACT = (
     "no reasoning, just the number. Some filler text may follow the question "
     "on the 'Filler:' line before the answer."
 )
+BOXED_NOTE = " Write the number as \\boxed{number}."
 SYSTEM_BY_TYPE = {"chained_var_binding": SYSTEM, "1fact_addition": SYSTEM_FACT, "2fact_addition": SYSTEM_FACT, "nfact_addition": SYSTEM_FACT, "arithmetic": SYSTEM_FACT}
 
 
@@ -44,15 +45,18 @@ def user_turn(item, filler, before=""):
     return (f"Filler: {before}\n\n" if before else "") + "\n".join(lines) + f"\n\n{filler_line}\n\nAnswer:"
 
 
-def build_messages(few_shot, item, kind="dots", k=0, n_shot=N_FEW_SHOT, fillers=None, befores=None):
-    """Chat messages; every few-shot example shows the same filler condition and placement as the test item. Given filler strings (one per shot, then the item's) override kind and k; befores are the fillers above the definitions."""
+def build_messages(few_shot, item, kind="dots", k=0, n_shot=N_FEW_SHOT, fillers=None, befores=None, boxed=False):
+    """Chat messages; every few-shot example shows the same filler condition and placement as the test item. Given filler strings (one per shot, then the item's) override kind and k; befores are the fillers above the definitions.
+    boxed: the shots answer \\boxed{N}, the system prompt says so, and a final assistant message \\boxed{ is the prefill for the test item."""
     fillers = [make_filler(kind, k)] * (n_shot + 1) if fillers is None else fillers
     befores = [""] * (n_shot + 1) if befores is None else befores
-    messages = [{"role": "system", "content": SYSTEM_BY_TYPE[item["type"]]}]
+    messages = [{"role": "system", "content": SYSTEM_BY_TYPE[item["type"]] + (BOXED_NOTE if boxed else "")}]
     for fs, filler, before in zip(few_shot[:n_shot], fillers, befores):
         messages.append({"role": "user", "content": user_turn(fs, filler, before)})
-        messages.append({"role": "assistant", "content": str(fs["answer"])})
+        messages.append({"role": "assistant", "content": f"\\boxed{{{fs['answer']}}}" if boxed else str(fs["answer"])})
     messages.append({"role": "user", "content": user_turn(item, fillers[-1], befores[-1])})
+    if boxed:
+        messages.append({"role": "assistant", "content": "\\boxed{"})
     return messages
 
 

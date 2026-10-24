@@ -102,12 +102,12 @@ def easy_tasks(n: int = 100) -> dict[str, tuple[list[dict], list[dict]]]:
     return out
 
 
-async def sweep(name: str):
+async def sweep(name: str, boxed: bool = False):
     m, tok = MODELS[name], AutoTokenizer.from_pretrained(MODELS[name]["hf"])
     client = None if m["mode"] != "tinker" else await tinker.ServiceClient().create_sampling_client_async(**({"model_path": m["model_path"]} if m["model_path"] else {"base_model": m["model"]}))
-    jobs = [(task, it, k, build_messages(shots, it, k=k)) for task, (shots, items) in easy_tasks().items() for it in items for k in [0, 100]]
+    jobs = [(task, it, k, build_messages(shots, it, k=k, boxed=boxed)) for task, (shots, items) in easy_tasks().items() for it in items for k in [0, 100]]
     rs = await o.gather_bar([ask(m, tok, msgs, m.get("provider"), client) for *_, msgs in jobs], concurrency=48, desc=f"sweep {name}")
-    with open(f"results/sweep_{name}.jsonl", "w") as f:
+    with open(f"results/sweep_{'boxed_' if boxed else ''}{name}.jsonl", "w") as f:
         for (task, it, k, _), r in zip(jobs, rs):
             row = {"task": task, "idx": it["idx"], "k": k, "answer": it["answer"], **(r or {"text": None, "error": True})}
             row["correct"] = lead_int(row["text"]) == it["answer"]
@@ -118,35 +118,49 @@ async def sweep(name: str):
 
 
 def plot_sweep(names: list[str]):
-    """Accuracy at 0 and 100 dots per easy task (x) per model (panel); the 10-80% band is shaded."""
+    """Accuracy at 0 and 100 dots per easy task (x) per model (panel), plain prompt and with the \\boxed{ prefill; the 10-80% band is shaded."""
     plt.style.use("dark_background")
     levels = list(easy_tasks())
-    fig, axes = plt.subplots(1, len(names), figsize=(7 * len(names), 4.8), sharey=True, squeeze=False)
+    fig, axes = plt.subplots(1, len(names), figsize=(8 * len(names), 4.8), sharey=True, squeeze=False)
     for ax, n in zip(axes[0], names):
-        rows = [json.loads(l) for l in open(f"results/sweep_{n}.jsonl")]
-        for j, (k, col) in enumerate([(0, "#5b8def"), (100, "#e0605b")]):
-            acc = [np.mean([r["correct"] for r in rows if r["task"] == t and r["k"] == k]) for t in levels]
-            ax.bar(np.arange(len(levels)) + (j - 0.5) * 0.38, acc, 0.36, color=col, label=f"{k} dots", yerr=[1.96 * np.sqrt(a * (1 - a) / 100) for a in acc], ecolor="#bbbbbb", capsize=2)
+        arms = [("plain", "", "#5b8def", "#e0605b"), ("boxed", "boxed_", "#2d4f9e", "#9c3a36")]
+        for a, (label, pre, c0, c100) in enumerate(arms):
+            rows = [json.loads(l) for l in open(f"results/sweep_{pre}{n}.jsonl")]
+            for j, (k, col) in enumerate([(0, c0), (100, c100)]):
+                acc = [np.mean([r["correct"] for r in rows if r["task"] == t and r["k"] == k]) for t in levels]
+                ax.bar(np.arange(len(levels)) + (2 * a + j - 1.5) * 0.2, acc, 0.19, color=col, label=f"{label}, {k} dots", yerr=[1.96 * np.sqrt(x * (1 - x) / 100) for x in acc], ecolor="#bbbbbb", capsize=1.5)
         ax.axhspan(0.1, 0.8, color="#ffffff", alpha=0.06)
         ax.set_xticks(range(len(levels)), levels, rotation=30, ha="right", fontsize=8)
         ax.set_title(n)
         ax.grid(axis="y", alpha=0.2)
     axes[0][0].set_ylabel("greedy accuracy, no reasoning (n=100)")
     axes[0][0].legend(loc="upper left", fontsize=8)
-    fig.suptitle("Difficulty sweep for no-CoT filler tasks: easier variants at 0 and 100 dots; shaded = the 10-80% band", fontsize=11)
+    fig.suptitle("Difficulty sweep for no-CoT filler tasks: easier variants at 0 and 100 dots, plain prompt vs \\boxed{ answer prefill; shaded = the 10-80% band", fontsize=11)
     fig.tight_layout()
     out = "/home/ek/wgmn/mats12_sprint/figures/filler_sweep.png"
     fig.savefig(out, dpi=130)
     print(out)
 
 
+def split_prefill(messages: list[dict]) -> tuple[list[dict], str]:
+    """A trailing assistant message is the answer prefill."""
+    return (messages[:-1], messages[-1]["content"]) if messages[-1]["role"] == "assistant" else (messages, "")
+
+
 def harmony(tok, messages: list[dict]) -> str:
-    return tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, reasoning_effort="low") + "<|channel|>analysis<|message|><|end|><|start|>assistant<|channel|>final<|message|>"
+    messages, prefill = split_prefill(messages)
+    return tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, reasoning_effort="low") + "<|channel|>analysis<|message|><|end|><|start|>assistant<|channel|>final<|message|>" + prefill
+
+
+def qwen_raw(tok, messages: list[dict]) -> str:
+    """Qwen's chat template with thinking off (an empty think block) and the prefill inside the assistant turn, for raw completions."""
+    messages, prefill = split_prefill(messages)
+    return tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, enable_thinking=False) + prefill
 
 
 def lead_int(text: str | None) -> int | None:
     """The leading integer: crusoe does not stop at gpt-oss's <|end|> and returns the next turn as text after the answer. Same as prompts.parse_answer on the chat models' bare-integer replies."""
-    m = re.match(r"\s*(-?\d+)(?!\d)", text or "")
+    m = re.match(r"\s*(?:\\boxed\{)?\s*(-?\d+)(?!\d)", text or "")  # a provider may echo the \boxed{ prefill
     return int(m.group(1)) if m else None
 
 
@@ -157,11 +171,12 @@ async def ask(m: dict, tok, messages: list[dict], provider: str, client=None) ->
         return {"text": tok.decode(seq.tokens), "reasoning": None, "finish_reason": str(seq.stop_reason), "provider": "tinker", "model": m["model_path"] or m["model"], "prompt_tokens": len(ids),
                 "completion_tokens": len(seq.tokens), "reasoning_tokens": 0, "cost": (0.33 * len(ids) + 0.84 * len(seq.tokens)) / 1e6, "n_local": len(ids)}
     if m["mode"] == "chat":
-        body = await o.chat(messages, m["model"], provider=provider, reasoning=False, max_tokens=16, temperature=0.0)
+        # a trailing assistant message is sent as a prefill (DeepInfra continues it and echoes it in the reply)
+        body = await o.chat(messages, m["model"], provider=provider, reasoning=False, max_tokens=16, temperature=0.0, stop=["}"] if split_prefill(messages)[1] else None)
         n_local = None
     else:
         prompt = harmony(tok, messages)
-        body = await o.complete(prompt, m["model"], provider=provider, max_tokens=16, temperature=0.0, stop=["<|end|>", "<|return|>"])
+        body = await o.complete(prompt, m["model"], provider=provider, max_tokens=16, temperature=0.0, stop=["<|end|>", "<|return|>"] + (["}"] if split_prefill(messages)[1] else []))
         n_local = len(tok.encode(prompt, add_special_tokens=False))
     return {**o.flat(body), "n_local": n_local}
 
@@ -232,7 +247,7 @@ if __name__ == "__main__":
     elif cmd == "run":
         asyncio.run(run(sys.argv[2]))
     elif cmd == "sweep":
-        asyncio.run(sweep(sys.argv[2]))
+        asyncio.run(sweep(sys.argv[2], boxed="--boxed" in sys.argv))
     elif cmd == "plot_sweep":
         plot_sweep(sys.argv[2:])
     else:
