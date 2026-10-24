@@ -3,7 +3,7 @@ Four tasks: Olivia's equations, 1-fact addition (the V4 Flash known-fact set), B
 gpt-oss CoT-control checkpoints (and base gpt-oss for a same-sampler baseline) run on Tinker with the same harmony prompt, greedy.
 Usage: python or_bench.py probe <model> <provider>... | run <model> | plot <figure name> <model>... | sweep <model> | plot_sweep <model>.... Rows go to results/or_{model}.jsonl.
 sweep: easier task variants (easy_tasks), 100 items each at 0 and 100 dots, to find where gpt-oss and Qwen solve 10-80% with no CoT; rows in results/sweep_{model}.jsonl.
-battery: the in-band variants (BAND) with the boxed prefill, 500 items at 0 / 10 / 100 dots; rows in results/band_{model}.jsonl; plot them with plot --band."""
+battery: the in-band variants (BAND, or the task names given) with the boxed prefill, 500 items at 0 / 10 / 100 dots; rows in results/band_{model}.jsonl; plot them with plot --band."""
 import asyncio
 import json
 import random
@@ -18,6 +18,14 @@ from transformers import AutoTokenizer
 from mechtools import openrouter as o
 
 from prompts import build_messages
+import importlib.util
+from huggingface_hub import hf_hub_download
+
+# DeepSeek V4.1 Flash 1017's own prompt renderer (encoding/encoding.py in its HF repo; no chat template). Differs from the V4 Flash encoder in utils.py by wrapping the system prompt in <｜System｜>; the V4 render scored about 14 pp lower on Parasail raw completions.
+_spec = importlib.util.spec_from_file_location("encoding41", hf_hub_download("deepseek-ai/DeepSeek-V4.1-Flash-1017", "encoding/encoding.py"))
+_enc41 = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_enc41)
+encode_messages_41 = _enc41.encode_messages
 
 o.load_env()
 KS = [0, 10, 100]
@@ -28,6 +36,10 @@ MODELS = {
     "gpt-oss-120b": {"model": "openai/gpt-oss-120b", "hf": "openai/gpt-oss-120b", "mode": "harmony", "provider": "crusoe"},
     # mode "tinker": the harmony prompt sampled on Tinker (model_path None = base)
     "gpt-oss-120b-tinker": {"model": "openai/gpt-oss-120b", "hf": "openai/gpt-oss-120b", "mode": "tinker", "model_path": None},
+    # mode "tinker-ds": DeepSeek V4.1 Flash 1017 on Tinker, the V4 encoder's chat-mode (non-thinking) render with the prefill after </think>; model_path None = base. The two SFT checkpoints with a CoT-control gain (runs/2026-10-24_cot-control_{rewrite-sft,sft-compliant}.md)
+    "deepseek-tinker": {"model": "deepseek-ai/DeepSeek-V4.1-Flash-1017:peft:262144", "hf": "deepseek-ai/DeepSeek-V4.1-Flash-1017", "mode": "tinker-ds", "model_path": None},
+    "rwsft1-ep2": {"model": "deepseek-ai/DeepSeek-V4.1-Flash-1017", "hf": "deepseek-ai/DeepSeek-V4.1-Flash-1017", "mode": "tinker-ds", "model_path": "tinker://5ba907ce-a8af-54d5-8f1d-e72031a411ea:train:0/sampler_weights/cotctl-rwsft1-ep2"},
+    "sft2-ep8": {"model": "deepseek-ai/DeepSeek-V4.1-Flash-1017", "hf": "deepseek-ai/DeepSeek-V4.1-Flash-1017", "mode": "tinker-ds", "model_path": "tinker://fe8c9f59-b4c1-5393-b8a0-b8640ea89700:train:0/sampler_weights/cotctl-sft2-ep8"},
     "grpo3-s100": {"model": "openai/gpt-oss-120b", "hf": "openai/gpt-oss-120b", "mode": "tinker", "model_path": "tinker://ec5bf27e-1436-5923-a854-96774a207315:train:0/sampler_weights/cotctl-grpo3-step100"},
     "manytypes1b-s150": {"model": "openai/gpt-oss-120b", "hf": "openai/gpt-oss-120b", "mode": "tinker", "model_path": "tinker://f6204b00-be4d-51fd-b1d8-6d467ff4ba75:train:0/sampler_weights/cotctl-manytypes1b-step150"},
     "st1-ignore2-s60": {"model": "openai/gpt-oss-120b", "hf": "openai/gpt-oss-120b", "mode": "tinker", "model_path": "tinker://1e287f2d-ec6a-5554-8582-db39196492df:train:0/sampler_weights/cotctl-st1-ignore2-step60"},
@@ -106,11 +118,11 @@ def easy_tasks(n: int = 100) -> dict[str, tuple[list[dict], list[dict]]]:
 BAND = ["eq1hop_t5", "fact_bare", "fact_plus1"]  # where base gpt-oss-120b scores 15-82% with the boxed prefill (sweep, 2026-10-24)
 
 
-async def battery(name: str):
+async def battery(name: str, names: list[str] | None = None):
     m, tok = MODELS[name], AutoTokenizer.from_pretrained(MODELS[name]["hf"])
-    client = None if m["mode"] != "tinker" else await tinker.ServiceClient().create_sampling_client_async(**({"model_path": m["model_path"]} if m["model_path"] else {"base_model": m["model"]}))
-    T = easy_tasks(500)
-    jobs = [(task, it, k, build_messages(*T[task][:1], it, k=k, boxed=True)) for task in BAND for it in T[task][1] for k in KS]
+    client = None if not m["mode"].startswith("tinker") else await tinker.ServiceClient().create_sampling_client_async(**({"model_path": m["model_path"]} if m["model_path"] else {"base_model": m["model"]}))
+    T = easy_tasks(500) | tasks()
+    jobs = [(task, it, k, build_messages(*T[task][:1], it, k=k, boxed=True)) for task in (names or BAND) for it in T[task][1] for k in KS]
     rs = await o.gather_bar([ask(m, tok, msgs, m.get("provider"), client) for *_, msgs in jobs], concurrency=48, desc=f"battery {name}")
     with open(f"results/band_{name}.jsonl", "w") as f:
         for (task, it, k, _), r in zip(jobs, rs):
@@ -122,7 +134,7 @@ async def battery(name: str):
 
 async def sweep(name: str, boxed: bool = False):
     m, tok = MODELS[name], AutoTokenizer.from_pretrained(MODELS[name]["hf"])
-    client = None if m["mode"] != "tinker" else await tinker.ServiceClient().create_sampling_client_async(**({"model_path": m["model_path"]} if m["model_path"] else {"base_model": m["model"]}))
+    client = None if not m["mode"].startswith("tinker") else await tinker.ServiceClient().create_sampling_client_async(**({"model_path": m["model_path"]} if m["model_path"] else {"base_model": m["model"]}))
     jobs = [(task, it, k, build_messages(shots, it, k=k, boxed=boxed)) for task, (shots, items) in easy_tasks().items() for it in items for k in [0, 100]]
     rs = await o.gather_bar([ask(m, tok, msgs, m.get("provider"), client) for *_, msgs in jobs], concurrency=48, desc=f"sweep {name}")
     with open(f"results/sweep_{'boxed_' if boxed else ''}{name}.jsonl", "w") as f:
@@ -170,6 +182,12 @@ def harmony(tok, messages: list[dict]) -> str:
     return tok.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, reasoning_effort="low") + "<|channel|>analysis<|message|><|end|><|start|>assistant<|channel|>final<|message|>" + prefill
 
 
+def ds_raw(messages: list[dict]) -> str:
+    """DeepSeek V4.1 chat-mode render (ends in <｜Assistant｜></think>) plus the prefill."""
+    messages, prefill = split_prefill(messages)
+    return encode_messages_41(messages, thinking_mode="chat") + prefill
+
+
 def qwen_raw(tok, messages: list[dict]) -> str:
     """Qwen's chat template with thinking off (an empty think block) and the prefill inside the assistant turn, for raw completions."""
     messages, prefill = split_prefill(messages)
@@ -183,9 +201,10 @@ def lead_int(text: str | None) -> int | None:
 
 
 async def ask(m: dict, tok, messages: list[dict], provider: str, client=None) -> dict:
-    if m["mode"] == "tinker":
-        ids = tok.encode(harmony(tok, messages), add_special_tokens=False)
-        seq = (await client.sample_async(prompt=tinker.ModelInput.from_ints(ids), num_samples=1, sampling_params=TK_PARAMS)).sequences[0]
+    if m["mode"] in ("tinker", "tinker-ds"):
+        ids = tok.encode(harmony(tok, messages) if m["mode"] == "tinker" else ds_raw(messages), add_special_tokens=False)
+        params = TK_PARAMS if m["mode"] == "tinker" else tinker.SamplingParams(temperature=0.0, max_tokens=8, stop=[tok.eos_token_id])
+        seq = (await client.sample_async(prompt=tinker.ModelInput.from_ints(ids), num_samples=1, sampling_params=params)).sequences[0]
         return {"text": tok.decode(seq.tokens), "reasoning": None, "finish_reason": str(seq.stop_reason), "provider": "tinker", "model": m["model_path"] or m["model"], "prompt_tokens": len(ids),
                 "completion_tokens": len(seq.tokens), "reasoning_tokens": 0, "cost": (0.33 * len(ids) + 0.84 * len(seq.tokens)) / 1e6, "n_local": len(ids)}
     if m["mode"] == "chat":
@@ -214,7 +233,7 @@ async def probe(name: str, providers: list[str]):
 
 async def run(name: str):
     m, tok = MODELS[name], AutoTokenizer.from_pretrained(MODELS[name]["hf"])
-    client = None if m["mode"] != "tinker" else await tinker.ServiceClient().create_sampling_client_async(**({"model_path": m["model_path"]} if m["model_path"] else {"base_model": m["model"]}))
+    client = None if not m["mode"].startswith("tinker") else await tinker.ServiceClient().create_sampling_client_async(**({"model_path": m["model_path"]} if m["model_path"] else {"base_model": m["model"]}))
     jobs = [(task, it, k, build_messages(shots, it, k=k)) for task, (shots, items) in tasks().items() for it in items for k in KS]
     rs = await o.gather_bar([ask(m, tok, msgs, m.get("provider"), client) for *_, msgs in jobs], concurrency=48, desc=name)
     with open(f"results/or_{name}.jsonl", "w") as f:
@@ -266,7 +285,7 @@ if __name__ == "__main__":
     elif cmd == "run":
         asyncio.run(run(sys.argv[2]))
     elif cmd == "battery":
-        asyncio.run(battery(sys.argv[2]))
+        asyncio.run(battery(sys.argv[2], sys.argv[3:] or None))
     elif cmd == "sweep":
         asyncio.run(sweep(sys.argv[2], boxed="--boxed" in sys.argv))
     elif cmd == "plot_sweep":
