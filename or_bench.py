@@ -104,6 +104,7 @@ def plot(out_name: str, names: list[str]):
     rows = {n: [json.loads(l) for l in open(f"results/or_{n}.jsonl")] for n in names}
     fig, axes = plt.subplots(1, 4, figsize=(5 * len(names) + 3, 5.2), sharey=True)
     colors = ["#5b8def", "#f2a541", "#e0605b"]
+    top = 0.0
     for ax, task in zip(axes, tasks()):
         for i, n in enumerate(names):
             by = {(r["idx"], r["k"]): r["correct"] for r in rows[n] if r["task"] == task}
@@ -111,14 +112,16 @@ def plot(out_name: str, names: list[str]):
             c = {k: np.array([by[(j, k)] for j in idxs], float) for k in KS}
             for j, k in enumerate(KS):
                 x, acc = i + (j - 1) * 0.27, c[k].mean()
+                top = max(top, acc)
                 ax.bar(x, acc, 0.25, color=colors[j], label=f"{k} dots" if i == 0 else None, yerr=1.96 * np.sqrt(acc * (1 - acc) / len(idxs)), ecolor="#bbbbbb", capsize=2)
                 if k:
                     d = c[k] - c[0]
-                    ax.text(x, acc + 0.06, f"{100 * d.mean():+.1f}\n±{196 * d.std(ddof=1) / np.sqrt(len(d)):.1f}", ha="center", fontsize=7.5, color="#dddddd")
+                    ax.text(x, acc + 0.012 * (1 if top < 0.5 else 5), f"{100 * d.mean():+.1f}\n±{196 * d.std(ddof=1) / np.sqrt(len(d)):.1f}", ha="center", fontsize=7.5, color="#dddddd")
         ax.set_xticks(range(len(names)), names, fontsize=8, rotation=20 if len(names) > 3 else 0)
         ax.set_title(f"{task} (n={len(idxs)})")
-        ax.set_ylim(0, 1.2)
         ax.grid(axis="y", alpha=0.2)
+    for ax in axes:
+        ax.set_ylim(0, min(1.2, 2.2 * top))  # the axis fits the data: the organisms sit under 10%
     axes[0].set_ylabel("greedy accuracy, no reasoning")
     axes[0].legend(loc="upper left", fontsize=8)
     fig.suptitle("Filler uplift, no reasoning: k dots on the 'Filler:' line, same filler in every shot, T=0. Numbers: uplift vs 0 dots, pp ± paired 95% CI", fontsize=11)
